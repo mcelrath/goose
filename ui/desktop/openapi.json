@@ -5250,6 +5250,44 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "HTTP context provider — injected into every MOIM turn.",
+            "required": [
+              "name",
+              "url",
+              "type"
+            ],
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "timeout": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Request timeout in seconds (default: 5).",
+                "minimum": 0
+              },
+              "token": {
+                "type": "string",
+                "description": "Optional bearer token sent as Authorization header.",
+                "nullable": true
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "context_provider"
+                ]
+              },
+              "url": {
+                "type": "string",
+                "description": "Base URL. goose calls GET {url}?query=<encoded_prompt>&session_id=<id>"
+              }
+            }
           }
         ],
         "description": "Represents the different types of MCP extensions that can be added to the manager",
@@ -6447,13 +6485,13 @@
         "type": "object",
         "description": "Information about a model's capabilities",
         "required": [
-          "name",
-          "context_limit"
+          "name"
         ],
         "properties": {
           "context_limit": {
             "type": "integer",
-            "description": "The maximum context length this model supports",
+            "description": "The maximum context length this model supports; None means unknown (provider will probe)",
+            "nullable": true,
             "minimum": 0
           },
           "currency": {

@@ -842,6 +842,9 @@ impl ExtensionManager {
                     "SSE is unsupported, migrate to streamable_http".to_string(),
                 ));
             }
+            ExtensionConfig::ContextProvider { .. } => {
+                return Ok(());
+            }
             ExtensionConfig::StreamableHttp {
                 uri,
                 timeout,
@@ -1848,7 +1851,8 @@ impl ExtensionManager {
                     | ExtensionConfig::StreamableHttp { description, .. }
                     | ExtensionConfig::Stdio { description, .. }
                     | ExtensionConfig::Frontend { description, .. }
-                    | ExtensionConfig::InlinePython { description, .. } => description,
+                    | ExtensionConfig::InlinePython { description, .. }
+                    | ExtensionConfig::ContextProvider { description, .. } => description,
                 };
                 disabled_extensions.push(format!("- {} - {}", config.name(), description));
             }
@@ -1903,6 +1907,7 @@ impl ExtensionManager {
         &self,
         session_id: &str,
         working_dir: &std::path::Path,
+        kb_query: Option<&str>,
     ) -> Option<String> {
         // Skip MOIM for models with small context windows to avoid consuming limited context
         const MIN_CONTEXT_FOR_MOIM: usize = 32_000;
@@ -1969,6 +1974,109 @@ impl ExtensionManager {
                 tracing::debug!("MOIM content from {}: {} chars", name, moim_content.len());
                 content.push('\n');
                 content.push_str(&moim_content);
+            }
+        }
+
+        // Inject any unread bridge messages addressed to goose.
+        let bridge_reader = crate::bridge::BridgeReader::new("goose");
+        if let Ok(msgs) = bridge_reader.fetch_unread() {
+            if let Some(bridge_text) = crate::bridge::format_for_injection(&msgs) {
+                content.push_str("\n\nUnread peer messages via agent-bridge:\n");
+                content.push_str(&bridge_text);
+            }
+        }
+
+        // Dispatch all enabled ContextProvider configs in parallel.
+        let context_provider_configs: Vec<(String, String, u64, Option<String>)> =
+            get_all_extensions()
+                .into_iter()
+                .filter(|e| e.enabled)
+                .filter_map(|e| {
+                    if let ExtensionConfig::ContextProvider {
+                        name,
+                        url,
+                        timeout,
+                        token,
+                        ..
+                    } = e.config
+                    {
+                        Some((name, url, timeout, token))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+        if !context_provider_configs.is_empty() {
+            let kb_query_str = kb_query.unwrap_or("").to_string();
+            let session_id_str = session_id.to_string();
+
+            let futures: Vec<
+                std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(String, String)>> + Send>,
+                >,
+            > = context_provider_configs
+                .into_iter()
+                .map(|(name, base_url, timeout_secs, token)| {
+                    let kb_query_str = kb_query_str.clone();
+                    let session_id_str = session_id_str.clone();
+                    let fut: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Option<(String, String)>> + Send>,
+                    > = Box::pin(async move {
+                        let mut parsed = match url::Url::parse(&base_url) {
+                            Ok(u) => u,
+                            Err(_) => return None,
+                        };
+                        parsed
+                            .query_pairs_mut()
+                            .append_pair("query", &kb_query_str)
+                            .append_pair("session_id", &session_id_str);
+                        let mut req = reqwest::Client::new().get(parsed);
+                        if let Some(tok) = token {
+                            req = req.header("Authorization", format!("Bearer {}", tok));
+                        }
+                        let result: Result<
+                            Result<reqwest::Response, reqwest::Error>,
+                            tokio::time::error::Elapsed,
+                        > = tokio::time::timeout(Duration::from_secs(timeout_secs), req.send())
+                            .await;
+                        match result {
+                            Ok(Ok(resp)) if resp.status().is_success() => {
+                                let content_type: String = resp
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                match resp.text().await {
+                                    Ok(body) if !body.is_empty() => {
+                                        let text = if content_type.contains("application/json") {
+                                            serde_json::from_str::<serde_json::Value>(&body)
+                                                .ok()
+                                                .and_then(|v| {
+                                                    v.get("text")
+                                                        .and_then(|t| t.as_str())
+                                                        .map(|s| s.to_string())
+                                                })
+                                                .unwrap_or(body)
+                                        } else {
+                                            body
+                                        };
+                                        Some((name, text))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    });
+                    fut
+                })
+                .collect();
+
+            let results: Vec<Option<(String, String)>> = future::join_all(futures).await;
+            for (name, text) in results.into_iter().flatten() {
+                content.push_str(&format!("\n\n[{}]:\n{}", name, text));
             }
         }
 
@@ -2372,7 +2480,7 @@ mod tests {
         let em = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
         let working_dir = std::path::Path::new("/tmp");
 
-        if let Some(moim) = em.collect_moim("test-session-id", working_dir).await {
+        if let Some(moim) = em.collect_moim("test-session-id", working_dir, None).await {
             let ts_line = moim
                 .lines()
                 .find(|l| l.starts_with("It is currently "))
@@ -2856,6 +2964,138 @@ mod tests {
     /// taken).  Uses a pre-seeded `InMemoryCredentialStore` with a fake,
     /// non-expiring token so `get_access_token()` returns immediately without
     /// touching any OAuth endpoints or the system keychain.
+    /// Mirrors the ContextProvider fetch logic in `collect_moim`: 200 with plain text body
+    /// should be returned as-is; this is the success path.
+    #[tokio::test]
+    async fn test_context_provider_200_returns_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("relevant context here"))
+            .mount(&mock_server)
+            .await;
+
+        let url = mock_server.uri();
+        let timeout_secs: u64 = 5;
+
+        let mut parsed = url::Url::parse(&url).unwrap();
+        parsed
+            .query_pairs_mut()
+            .append_pair("query", "test")
+            .append_pair("session_id", "test-session");
+        let req = reqwest::Client::new().get(parsed);
+        let result: Result<Result<reqwest::Response, reqwest::Error>, tokio::time::error::Elapsed> =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), req.send()).await;
+
+        let text = match result {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                let content_type: String = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                match resp.text().await {
+                    Ok(body) if !body.is_empty() => {
+                        let text = if content_type.contains("application/json") {
+                            serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .unwrap_or(body)
+                        } else {
+                            body
+                        };
+                        Some(text)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        assert_eq!(text.as_deref(), Some("relevant context here"));
+    }
+
+    /// Mirrors the ContextProvider fetch logic: a non-200 response must produce None
+    /// (the error is silently swallowed, not propagated to the caller).
+    #[tokio::test]
+    async fn test_context_provider_non_200_returns_none() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&mock_server)
+            .await;
+
+        let url = mock_server.uri();
+        let timeout_secs: u64 = 5;
+
+        let mut parsed = url::Url::parse(&url).unwrap();
+        parsed
+            .query_pairs_mut()
+            .append_pair("query", "test")
+            .append_pair("session_id", "test-session");
+        let req = reqwest::Client::new().get(parsed);
+        let result: Result<Result<reqwest::Response, reqwest::Error>, tokio::time::error::Elapsed> =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), req.send()).await;
+
+        let text: Option<String> = match result {
+            Ok(Ok(resp)) if resp.status().is_success() => resp.text().await.ok(),
+            _ => None,
+        };
+
+        assert_eq!(text, None, "non-200 response should produce None");
+    }
+
+    /// Mirrors the ContextProvider fetch logic: a timeout must produce None
+    /// (the Elapsed error arm maps to None).
+    #[tokio::test]
+    async fn test_context_provider_timeout_returns_none() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Respond after a 200 ms delay; our timeout is 1 ms, so it will expire first.
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("too late")
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let url = mock_server.uri();
+
+        let mut parsed = url::Url::parse(&url).unwrap();
+        parsed
+            .query_pairs_mut()
+            .append_pair("query", "test")
+            .append_pair("session_id", "test-session");
+        let req = reqwest::Client::new().get(parsed);
+        // 1 ms timeout — expires before the 200 ms server delay, guaranteeing Elapsed.
+        let result: Result<Result<reqwest::Response, reqwest::Error>, tokio::time::error::Elapsed> =
+            tokio::time::timeout(Duration::from_millis(1), req.send()).await;
+
+        let text: Option<String> = match result {
+            Ok(Ok(resp)) if resp.status().is_success() => resp.text().await.ok(),
+            _ => None,
+        };
+
+        assert_eq!(text, None, "timeout should produce None");
+    }
+
     #[tokio::test]
     async fn test_custom_headers_forwarded_oauth_path() {
         use rmcp::transport::auth::{

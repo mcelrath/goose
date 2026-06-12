@@ -2323,8 +2323,7 @@ impl Agent {
                         .await
                         .collect_new_subdirectory_hints(&working_dir);
                     if let Some(hints) = hint_text {
-                        let hint_msg = Message::user().with_text(hints);
-                        session_manager.add_message(&session_config.id, &hint_msg).await?;
+                        messages_to_add.push(Message::user().with_text(hints));
                     }
                 }
 

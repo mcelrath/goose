@@ -210,7 +210,8 @@ fn config_to_goose_extension(
         }
         ExtensionConfig::Frontend { .. }
         | ExtensionConfig::InlinePython { .. }
-        | ExtensionConfig::Sse { .. } => return Ok(None),
+        | ExtensionConfig::Sse { .. }
+        | ExtensionConfig::ContextProvider { .. } => return Ok(None),
     };
     Ok(Some(extension))
 }

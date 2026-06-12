@@ -18,8 +18,17 @@ pub async fn inject_moim(
         return conversation;
     }
 
+    // Extract the last user message text to drive context-provider queries.
+    let kb_query: Option<String> = conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == rmcp::model::Role::User)
+        .map(|m| m.as_concat_text())
+        .filter(|s| !s.is_empty());
+
     if let Some(moim) = extension_manager
-        .collect_moim(session_id, working_dir)
+        .collect_moim(session_id, working_dir, kb_query.as_deref())
         .await
     {
         let mut messages = conversation.messages().clone();

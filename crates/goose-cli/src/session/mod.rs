@@ -515,6 +515,21 @@ impl CliSession {
         loop {
             self.display_context_usage().await?;
 
+            // Check for unread bridge messages before prompting. If any arrive
+            // while idle, process them without waiting for keyboard input.
+            {
+                let bridge_reader = goose::bridge::BridgeReader::new("goose");
+                if let Ok(msgs) = bridge_reader.fetch_unread() {
+                    if let Some(text) = goose::bridge::format_for_injection(&msgs) {
+                        let msg = goose::conversation::message::Message::user()
+                            .with_text(format!("[agent-bridge] unread peer messages:\n\n{}", text));
+                        self.process_message(msg, CancellationToken::default(), true)
+                            .await?;
+                        continue;
+                    }
+                }
+            }
+
             let conversation_strings: Vec<String> = self
                 .messages
                 .iter()

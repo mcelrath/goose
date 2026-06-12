@@ -473,6 +473,22 @@ export type ExtensionConfig = {
      */
     timeout?: number | null;
     type: 'inline_python';
+} | {
+    description?: string;
+    name: string;
+    /**
+     * Request timeout in seconds (default: 5).
+     */
+    timeout?: number;
+    /**
+     * Optional bearer token sent as Authorization header.
+     */
+    token?: string | null;
+    type: 'context_provider';
+    /**
+     * Base URL. goose calls GET {url}?query=<encoded_prompt>&session_id=<id>
+     */
+    url: string;
 };
 
 /**
@@ -818,9 +834,9 @@ export type ModelDownloadStatus = {
  */
 export type ModelInfo = {
     /**
-     * The maximum context length this model supports
+     * The maximum context length this model supports; None means unknown (provider will probe)
      */
-    context_limit: number;
+    context_limit?: number | null;
     /**
      * Currency for the costs (default: "$")
      */

@@ -283,6 +283,21 @@ pub enum ExtensionConfig {
         #[serde(default)]
         available_tools: Vec<String>,
     },
+    /// HTTP context provider — injected into every MOIM turn.
+    #[serde(rename = "context_provider")]
+    ContextProvider {
+        name: String,
+        #[serde(default)]
+        description: String,
+        /// Base URL. goose calls GET {url}?query=<encoded_prompt>&session_id=<id>
+        url: String,
+        /// Request timeout in seconds (default: 5).
+        #[serde(default = "default_context_provider_timeout")]
+        timeout: u64,
+        /// Optional bearer token sent as Authorization header.
+        #[serde(default)]
+        token: Option<String>,
+    },
 }
 
 impl Default for ExtensionConfig {
@@ -398,6 +413,7 @@ impl ExtensionConfig {
             Self::Platform { name, .. } => name,
             Self::Frontend { name, .. } => name,
             Self::InlinePython { name, .. } => name,
+            Self::ContextProvider { name, .. } => name,
         }
         .to_string()
     }
@@ -406,6 +422,7 @@ impl ExtensionConfig {
     pub fn is_tool_available(&self, tool_name: &str) -> bool {
         let available_tools = match self {
             Self::Sse { .. } => return false, // SSE is unsupported
+            Self::ContextProvider { .. } => return false,
             Self::StreamableHttp {
                 available_tools, ..
             }
@@ -526,6 +543,9 @@ impl std::fmt::Display for ExtensionConfig {
             ExtensionConfig::InlinePython { name, code, .. } => {
                 write!(f, "InlinePython({}: {} chars)", name, code.len())
             }
+            ExtensionConfig::ContextProvider { name, url, .. } => {
+                write!(f, "ContextProvider({}: {})", name, url)
+            }
         }
     }
 }
@@ -546,6 +566,10 @@ impl ExtensionInfo {
             has_resources,
         }
     }
+}
+
+fn default_context_provider_timeout() -> u64 {
+    5
 }
 
 fn deserialize_null_with_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>

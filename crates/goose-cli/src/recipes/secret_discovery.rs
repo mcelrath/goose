@@ -63,6 +63,8 @@ fn extract_secrets_from_extensions(
                 tracing::warn!(name = %name, "SSE is unsupported, skipping");
                 continue;
             }
+            // ContextProvider is HTTP-based with no env secrets
+            ExtensionConfig::ContextProvider { .. } => continue,
         };
 
         for key in env_keys {
