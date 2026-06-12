@@ -59,6 +59,9 @@ if (process.env.APPLE_TEAM_ID) {
 
 module.exports = {
   packagerConfig: cfg,
+  // Pass ozone-platform-hint=auto on Linux so Electron uses Wayland when
+  // available without requiring DISPLAY or a manual env var.
+  electronArgs: process.platform === 'linux' ? ['--ozone-platform-hint=auto'] : [],
   rebuildConfig: {},
   publishers: [
     {
