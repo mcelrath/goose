@@ -380,8 +380,19 @@ export const startGoosed = async (options: StartGoosedOptions): Promise<GoosedRe
   };
   goosedProcess.stderr?.on('data', onStderrData);
 
+  // After startup completes, replace the verbose stderr listener with a minimal
+  // crash monitor so panics that occur during normal operation are logged.
+  const onCrashData = (data: Buffer) => {
+    for (const line of data.toString().split('\n')) {
+      if (line.trim()) {
+        logger.error(`goosed crash (port ${port}): ${line}`);
+      }
+    }
+  };
+
   const stopErrorLogCollection = () => {
     goosedProcess.stderr?.off('data', onStderrData);
+    goosedProcess.stderr?.on('data', onCrashData);
   };
 
   goosedProcess.on('exit', (code, signal) => {
