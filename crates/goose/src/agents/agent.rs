@@ -1476,7 +1476,7 @@ impl Agent {
 
         let message_text = user_message.as_concat_text();
 
-        if self
+        let injected_context = if self
             .hook_manager
             .has_hooks(crate::hooks::HookEvent::UserPromptSubmit)
         {
@@ -1486,9 +1486,11 @@ impl Agent {
             )
             .with_message(message_text.clone());
             self.hook_manager
-                .emit(crate::hooks::HookEvent::UserPromptSubmit, ctx)
-                .await;
-        }
+                .emit_collect(crate::hooks::HookEvent::UserPromptSubmit, ctx)
+                .await
+        } else {
+            String::new()
+        };
 
         let command_result = self
             .execute_command(&message_text, &session_config.id)
@@ -1553,11 +1555,17 @@ impl Agent {
                     .await?;
             }
             Ok(None) => {
+                let msg = if injected_context.is_empty() {
+                    user_message
+                } else {
+                    user_message.with_agent_text(injected_context)
+                };
                 session_manager
-                    .add_message(&session_config.id, &user_message)
+                    .add_message(&session_config.id, &msg)
                     .await?;
             }
         }
+
         let session = session_manager
             .get_session(&session_config.id, true)
             .await?;
@@ -1928,6 +1936,16 @@ impl Agent {
                                 if num_tool_requests == 0 {
                                     let text = filtered_response.as_concat_text();
                                     if !text.is_empty() {
+                                        if self.hook_manager.has_hooks(crate::hooks::HookEvent::AssistantResponse) {
+                                            let ctx = crate::hooks::HookContext::new(
+                                                crate::hooks::HookEvent::AssistantResponse,
+                                                &session_config.id,
+                                            )
+                                            .with_message(text.clone());
+                                            self.hook_manager
+                                                .emit(crate::hooks::HookEvent::AssistantResponse, ctx)
+                                                .await;
+                                        }
                                         last_assistant_text = text;
                                     }
                                     messages_to_add.push(response);
@@ -2299,14 +2317,14 @@ impl Agent {
                 }
 
                 {
-                    let has_new_hints = self
+                    let hint_text = self
                         .prompt_manager
                         .lock()
                         .await
-                        .load_subdirectory_hints(&working_dir);
-                    if has_new_hints && !tools_updated {
-                        (tools, toolshim_tools, system_prompt) =
-                            self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                        .collect_new_subdirectory_hints(&working_dir);
+                    if let Some(hints) = hint_text {
+                        let hint_msg = Message::user().with_text(hints);
+                        session_manager.add_message(&session_config.id, &hint_msg).await?;
                     }
                 }
 

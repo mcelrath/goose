@@ -41,7 +41,7 @@ async fn new_basic_session<C: Connection>(config: TestConnectionConfig) -> Basic
     let expected_session_id = C::expected_session_id();
     let openai = OpenAiFixture::new(
         vec![(
-            r#"</info-msg>\nwhat is 1+1""#.into(),
+            r#"what is 1+1"#.into(),
             include_str!("../acp_test_data/openai_basic.txt"),
         )],
         expected_session_id.clone(),
@@ -99,13 +99,10 @@ pub async fn run_session_name_update_notification<C: Connection>() {
     let openai = OpenAiFixture::new(
         vec![
             (
-                r#"</info-msg>\nwhat should we call this conversation?""#.into(),
+                r#"what should we call this conversation?\n<info-msg>"#.into(),
                 include_str!("../acp_test_data/openai_basic.txt"),
             ),
-            (
-                "Generate a short title for the above messages.".into(),
-                OPENAI_SESSION_NAME_RESPONSE,
-            ),
+            ("four words or less".into(), OPENAI_SESSION_NAME_RESPONSE),
         ],
         expected_session_id.clone(),
     )
@@ -1140,7 +1137,7 @@ pub async fn run_prompt_basic<C: Connection>() {
     let expected_session_id = C::expected_session_id();
     let openai = OpenAiFixture::new(
         vec![(
-            r#"</info-msg>\nwhat is 1+1""#.into(),
+            r#"what is 1+1"#.into(),
             include_str!("../acp_test_data/openai_basic.txt"),
         )],
         expected_session_id.clone(),
@@ -1168,7 +1165,7 @@ pub async fn run_prompt_codemode<C: Connection>() {
     let openai = OpenAiFixture::new(
         vec![
             (
-                format!(r#"</info-msg>\n{prompt}""#),
+                prompt.to_string(),
                 include_str!("../acp_test_data/openai_builtin_search.txt"),
             ),
             (
@@ -1215,8 +1212,7 @@ pub async fn run_prompt_image<C: Connection>() {
     let openai = OpenAiFixture::new(
         vec![
             (
-                r#"</info-msg>\nUse the get_image tool and describe what you see in its result.""#
-                    .into(),
+                r#"Use the get_image tool and describe what you see in its result."#.into(),
                 include_str!("../acp_test_data/openai_image_tool_call.txt"),
             ),
             (
@@ -1291,7 +1287,7 @@ pub async fn run_prompt_mcp<C: Connection>() {
     let openai = OpenAiFixture::new(
         vec![
             (
-                r#"</info-msg>\nUse the get_code tool and output only its result.""#.into(),
+                r#"Use the get_code tool and output only its result."#.into(),
                 include_str!("../acp_test_data/openai_tool_call.txt"),
             ),
             (

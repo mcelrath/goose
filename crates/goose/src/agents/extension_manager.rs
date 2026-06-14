@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{future, FutureExt};
 use once_cell::sync::Lazy;
@@ -1914,8 +1914,7 @@ impl ExtensionManager {
             }
         }
 
-        // Use minute-level granularity to prevent conversation changes every second
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:00").to_string();
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let mut content = format!(
             "<info-msg>\nIt is currently {}\nWorking directory: {}\n",
             timestamp,
@@ -2368,16 +2367,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect_moim_uses_minute_granularity() {
+    async fn test_collect_moim_timestamp_has_second_resolution() {
         let temp_dir = tempfile::tempdir().unwrap();
         let em = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
         let working_dir = std::path::Path::new("/tmp");
 
         if let Some(moim) = em.collect_moim("test-session-id", working_dir).await {
-            // Timestamp should end with :00 (seconds fixed to 00)
-            assert!(
-                moim.contains(":00\n"),
-                "Timestamp should use minute granularity"
+            let ts_line = moim
+                .lines()
+                .find(|l| l.starts_with("It is currently "))
+                .expect("MOIM should contain a timestamp line");
+            let ts_str = ts_line.trim_start_matches("It is currently ");
+            chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S").unwrap_or_else(
+                |e| panic!("Timestamp '{ts_str}' not in YYYY-MM-DD HH:MM:SS format: {e}"),
             );
         }
     }

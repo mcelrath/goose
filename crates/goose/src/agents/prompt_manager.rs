@@ -1,6 +1,3 @@
-#[cfg(test)]
-use chrono::DateTime;
-use chrono::Utc;
 use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::Value;
@@ -22,7 +19,6 @@ const MAX_TOOLS: usize = 50;
 pub struct PromptManager {
     system_prompt_override: Option<String>,
     system_prompt_extras: IndexMap<String, String>,
-    current_date_timestamp: String,
     subdirectory_hint_tracker: SubdirectoryHintTracker,
 }
 
@@ -35,7 +31,6 @@ impl Default for PromptManager {
 #[derive(Serialize)]
 struct SystemPromptContext {
     extensions: Vec<ExtensionInfo>,
-    current_date_time: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     extension_tool_limits: Option<(usize, usize)>,
     goose_mode: GooseMode,
@@ -144,7 +139,6 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
 
         let context = SystemPromptContext {
             extensions: sanitized_extensions_info,
-            current_date_time: self.manager.current_date_timestamp.clone(),
             extension_tool_limits,
             goose_mode,
             is_autonomous: goose_mode == GooseMode::Auto,
@@ -201,21 +195,13 @@ impl PromptManager {
         PromptManager {
             system_prompt_override: None,
             system_prompt_extras: IndexMap::new(),
-            // Use the fixed current date time so that prompt cache can be used.
-            // Filtering to an hour to balance user time accuracy and multi session prompt cache hits.
-            current_date_timestamp: Utc::now().format("%Y-%m-%d %H:00").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
         }
     }
 
     #[cfg(test)]
-    pub fn with_timestamp(dt: DateTime<Utc>) -> Self {
-        PromptManager {
-            system_prompt_override: None,
-            system_prompt_extras: IndexMap::new(),
-            current_date_timestamp: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
-        }
+    pub fn for_test() -> Self {
+        Self::new()
     }
 
     /// Add an additional instruction to the system prompt with a key
@@ -237,13 +223,21 @@ impl PromptManager {
             .record_tool_arguments(arguments, working_dir);
     }
 
-    pub fn load_subdirectory_hints(&mut self, working_dir: &Path) -> bool {
+    /// Returns new subdirectory hint text to be injected as a tail message,
+    /// without mutating the system prompt. Callers should append the returned
+    /// text as an agent-visible message so the system prompt stays stable.
+    pub fn collect_new_subdirectory_hints(&mut self, working_dir: &Path) -> Option<String> {
         let new_hints = self.subdirectory_hint_tracker.load_new_hints(working_dir);
-        let has_new = !new_hints.is_empty();
-        for (key, content) in new_hints {
-            self.system_prompt_extras.insert(key, content);
+        if new_hints.is_empty() {
+            return None;
         }
-        has_new
+        Some(
+            new_hints
+                .into_iter()
+                .map(|(_, content)| content)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
     }
 
     /// Override the system prompt with custom text
@@ -394,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_basic() {
-        let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let manager = PromptManager::for_test();
 
         let system_prompt = manager.builder().build();
 
@@ -403,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_one_extension() {
-        let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let manager = PromptManager::for_test();
 
         let system_prompt = manager
             .builder()
@@ -419,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_typical_setup() {
-        let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let manager = PromptManager::for_test();
 
         let system_prompt = manager
             .builder()
@@ -484,7 +478,7 @@ mod tests {
 
         extensions.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let manager = PromptManager::for_test();
         let system_prompt = manager
             .builder()
             .with_extensions(extensions.into_iter())

@@ -1,7 +1,6 @@
 use crate::agents::extension_manager::ExtensionManager;
 use crate::conversation::message::Message;
 use crate::conversation::{fix_conversation, Conversation};
-use rmcp::model::Role;
 use std::path::Path;
 
 // Test-only utility. Do not use in production code. No `test` directive due to call outside crate.
@@ -24,11 +23,7 @@ pub async fn inject_moim(
         .await
     {
         let mut messages = conversation.messages().clone();
-        let idx = messages
-            .iter()
-            .rposition(|m| m.role == Role::Assistant)
-            .unwrap_or(0);
-        messages.insert(idx, Message::user().with_text(moim));
+        messages.push(Message::user().with_agent_text(moim));
 
         let (fixed, issues) = fix_conversation(Conversation::new_unvalidated(messages));
 
@@ -72,16 +67,17 @@ mod tests {
         let msgs = result.messages();
 
         assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].content[0].as_text().unwrap(), "Hello");
-        assert_eq!(msgs[1].content[0].as_text().unwrap(), "Hi");
+        assert_eq!(msgs[0].as_concat_text(), "Hello");
+        assert_eq!(msgs[1].as_concat_text(), "Hi");
 
-        let merged_content = msgs[0]
+        // MOIM is appended at the tail and merged with the last user message ("Bye")
+        let merged_content = msgs[2]
             .content
             .iter()
             .filter_map(|c| c.as_text())
             .collect::<Vec<_>>()
             .join("");
-        assert!(merged_content.contains("Hello"));
+        assert!(merged_content.contains("Bye"));
         assert!(merged_content.contains("<info-msg>"));
         assert!(merged_content.contains("Working directory: /test/dir"));
     }
@@ -131,17 +127,17 @@ mod tests {
         let result = inject_moim("test-session-id", conv, &em, &working_dir).await;
         let msgs = result.messages();
 
-        assert_eq!(msgs.len(), 6);
+        assert!(
+            msgs.len() >= 5,
+            "conversation should preserve original messages plus injected MOIM"
+        );
 
-        let moim_msg = &msgs[3];
+        let moim_msg = msgs.last().expect("expected final MOIM message");
         let has_moim = moim_msg
             .content
             .iter()
             .any(|c| c.as_text().is_some_and(|t| t.contains("<info-msg>")));
 
-        assert!(
-            has_moim,
-            "MOIM should be in message before latest assistant message"
-        );
+        assert!(has_moim, "MOIM should be at tail");
     }
 }

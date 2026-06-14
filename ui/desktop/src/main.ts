@@ -54,6 +54,7 @@ import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-insta
 import { BLOCKED_PROTOCOLS, WEB_PROTOCOLS } from './utils/urlSecurity';
 import { buildCSP } from './utils/csp';
 
+
 function shouldSetupUpdater(): boolean {
   // Setup updater if either the flag is enabled OR dev updates are enabled
   return UPDATES_ENABLED || process.env.ENABLE_DEV_UPDATES === 'true';
@@ -2726,7 +2727,7 @@ async function appMain() {
       appWindow.focus();
 
       // Then reload
-      await appWindow.webContents.reload();
+      appWindow.webContents.reload();
     } catch (error) {
       console.error('Failed to refresh app:', error);
       throw error;

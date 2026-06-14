@@ -36,7 +36,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::plugins::discovery::{discover_enabled_plugins, DiscoveredPlugin};
+use crate::plugins::discovery::{DiscoveredPlugin, discover_enabled_plugins};
 
 /// Default per-hook timeout when the plugin does not specify one.
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
@@ -60,6 +60,12 @@ pub enum HookEvent {
     Stop,
     SubagentStart,
     SubagentStop,
+    /// Fires after the assistant produces a complete settled response (no
+    /// pending tool calls). The `message` field of [`HookContext`] carries the
+    /// full response text. Hooks may observe it for logging, kb ingestion, etc.
+    /// They MUST NOT block — fired via [`HookManager::emit`], not
+    /// `emit_blocking`.
+    AssistantResponse,
 }
 
 impl HookEvent {
@@ -78,6 +84,7 @@ impl HookEvent {
             HookEvent::Stop => "Stop",
             HookEvent::SubagentStart => "SubagentStart",
             HookEvent::SubagentStop => "SubagentStop",
+            HookEvent::AssistantResponse => "AssistantResponse",
         }
     }
 
@@ -96,6 +103,7 @@ impl HookEvent {
             "Stop" => HookEvent::Stop,
             "SubagentStart" => HookEvent::SubagentStart,
             "SubagentStop" => HookEvent::SubagentStop,
+            "AssistantResponse" => HookEvent::AssistantResponse,
             _ => return None,
         })
     }
@@ -277,6 +285,62 @@ impl HookManager {
     /// Returns true if any rule is registered for `event`.
     pub fn has_hooks(&self, event: HookEvent) -> bool {
         self.rules.get(&event).is_some_and(|r| !r.is_empty())
+    }
+
+    /// Like [`Self::emit`], but collects and returns stdout from all hooks
+    /// concatenated. Intended for `UserPromptSubmit` context injection.
+    pub async fn emit_collect(&self, event: HookEvent, ctx: HookContext) -> String {
+        let Some(rules) = self.rules.get(&event) else {
+            return String::new();
+        };
+
+        let payload = match serde_json::to_string(&ctx) {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(event = %event, error = %err, "Failed to serialize hook context");
+                return String::new();
+            }
+        };
+
+        let mut collected = String::new();
+        for rule in rules {
+            if let Some(matcher) = &rule.matcher {
+                let target = ctx.matcher_context.as_deref().unwrap_or("");
+                if !matcher.is_match(target) {
+                    continue;
+                }
+            }
+            for action in &rule.actions {
+                let LoadedAction::Command { command, timeout } = action;
+                match run_command_hook(command, &rule.plugin_root, &payload, *timeout).await {
+                    Ok(o) if o.status.success() => {
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        if !out.trim().is_empty() {
+                            collected.push_str(&out);
+                        }
+                    }
+                    Ok(o) => {
+                        warn!(
+                            plugin = %rule.plugin_name,
+                            event = %event,
+                            command = %command,
+                            exit = ?o.status.code(),
+                            "Plugin hook failed",
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            plugin = %rule.plugin_name,
+                            event = %event,
+                            command = %command,
+                            error = %err,
+                            "Plugin hook failed",
+                        );
+                    }
+                }
+            }
+        }
+        collected
     }
 
     /// Fire all rules whose matcher matches the event context. Errors from
