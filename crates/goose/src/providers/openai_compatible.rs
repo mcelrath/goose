@@ -93,6 +93,22 @@ impl Provider for OpenAiCompatibleProvider {
         self.model.clone()
     }
 
+    async fn probe_context_limit(&self) -> Option<usize> {
+        let response = self.api_client.response_get(None, "models").await.ok()?;
+        let json = handle_response_openai_compat(response).await.ok()?;
+        let model_name = &self.model.model_name;
+        json.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model_name.as_str()))
+            })
+            .and_then(|m| m.get("meta"))
+            .and_then(|meta| meta.get("n_ctx"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+    }
+
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         let response = self
             .api_client

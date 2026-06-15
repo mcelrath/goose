@@ -1,12 +1,12 @@
 use super::api_client::{ApiClient, AuthMethod};
 use super::base::{
-    ConfigKey, ModelInfo, Provider, ProviderDef, ProviderMetadata, DEFAULT_PROVIDER_TIMEOUT_SECS,
+    ConfigKey, DEFAULT_PROVIDER_TIMEOUT_SECS, ModelInfo, Provider, ProviderDef, ProviderMetadata,
 };
 use super::embedding::{EmbeddingCapable, EmbeddingRequest, EmbeddingResponse};
 use super::formats::openai_responses::{
-    create_responses_request, get_responses_usage, responses_api_to_message, ResponsesApiResponse,
+    ResponsesApiResponse, create_responses_request, get_responses_usage, responses_api_to_message,
 };
-use super::inventory::{config_secret_value, InventoryIdentityInput};
+use super::inventory::{InventoryIdentityInput, config_secret_value};
 use super::openai_compatible::{
     handle_response_openai_compat, handle_status, stream_openai_compat, stream_responses_compat,
 };
@@ -18,10 +18,10 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
+use goose_providers::formats::openai::{ModelConfigParams, is_openai_responses_model};
 use goose_providers::formats::openai::{
-    create_request_with_options, get_usage, response_to_message, OpenAiFormatOptions,
+    OpenAiFormatOptions, create_request_with_options, get_usage, response_to_message,
 };
-use goose_providers::formats::openai::{is_openai_responses_model, ModelConfigParams};
 use goose_providers::images::ImageFormat;
 use reqwest::StatusCode;
 use std::collections::HashMap;
@@ -732,6 +732,29 @@ impl Provider for OpenAiProvider {
 
     fn get_model_config(&self) -> ModelConfig {
         self.model.clone()
+    }
+
+    async fn probe_context_limit(&self) -> Option<usize> {
+        let models_path =
+            Self::map_base_path(&self.base_path, "models", OPEN_AI_DEFAULT_MODELS_PATH);
+        let response = self
+            .api_client
+            .request(None, &models_path)
+            .response_get()
+            .await
+            .ok()?;
+        let json = handle_response_openai_compat(response).await.ok()?;
+        let model_name = &self.model.model_name;
+        json.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model_name.as_str()))
+            })
+            .and_then(|m| m.get("meta"))
+            .and_then(|meta| meta.get("n_ctx"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {

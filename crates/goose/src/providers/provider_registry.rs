@@ -6,7 +6,7 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub type ProviderConstructor = Arc<
     dyn Fn(
@@ -34,6 +34,8 @@ pub struct ProviderEntry {
     pub(crate) cleanup: Option<ProviderCleanup>,
     provider_type: ProviderType,
     supports_inventory_refresh: bool,
+    /// Populated after probe_context_limit() succeeds; lets inventory reflect the runtime-probed value.
+    pub(crate) probed_context_limit: Arc<Mutex<Option<usize>>>,
 }
 
 impl ProviderEntry {
@@ -57,17 +59,19 @@ impl ProviderEntry {
         (self.inventory_configured)()
     }
 
+    pub fn get_probed_context_limit(&self) -> Option<usize> {
+        self.probed_context_limit.lock().ok().and_then(|g| *g)
+    }
+
     fn normalize_model_config(&self, mut model: ModelConfig) -> ModelConfig {
         model = model.with_canonical_limits(&self.metadata.name);
 
         if model.context_limit.is_none() {
-            if let Some(info) = self
-                .metadata
-                .known_models
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(&model.model_name) && m.context_limit > 0)
-            {
-                model.context_limit = Some(info.context_limit);
+            if let Some(info) = self.metadata.known_models.iter().find(|m| {
+                m.name.eq_ignore_ascii_case(&model.model_name)
+                    && m.context_limit.is_some_and(|l| l > 0)
+            }) {
+                model.context_limit = info.context_limit;
             }
         }
 
@@ -146,6 +150,7 @@ impl ProviderRegistry {
                     ProviderType::Builtin
                 },
                 supports_inventory_refresh: F::supports_inventory_refresh(),
+                probed_context_limit: Arc::new(Mutex::new(None)),
             },
         );
     }
@@ -297,15 +302,42 @@ impl ProviderRegistry {
             )
         });
 
+        let probed_limit_slot: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+        let probed_limit_slot_ctor = probed_limit_slot.clone();
+
         self.entries.insert(
             config.name.clone(),
             ProviderEntry {
                 metadata: custom_metadata,
                 constructor: Arc::new(move |model, _extensions, _working_dir| {
                     let result = constructor(model);
+                    let slot = probed_limit_slot_ctor.clone();
                     Box::pin(async move {
                         let provider = result?;
-                        Ok(Arc::new(provider) as Arc<dyn Provider>)
+                        let provider: Arc<dyn Provider> = Arc::new(provider);
+                        // If context_limit is still unset after static/canonical lookup,
+                        // ask the provider to probe it from its /v1/models endpoint.
+                        if provider.get_model_config().context_limit.is_none() {
+                            if let Some(limit) = provider.probe_context_limit().await {
+                                tracing::debug!(
+                                    "probed context_limit={} from /v1/models for {}",
+                                    limit,
+                                    provider.get_model_config().model_name
+                                );
+                                if let Ok(mut guard) = slot.lock() {
+                                    *guard = Some(limit);
+                                }
+                                // Return a wrapper that overrides context_limit.
+                                let mut config = provider.get_model_config();
+                                config.context_limit = Some(limit);
+                                return Ok(Arc::new(
+                                    crate::providers::context_override::ContextOverrideProvider::new(
+                                        provider, config,
+                                    ),
+                                ) as Arc<dyn Provider>);
+                            }
+                        }
+                        Ok(provider)
                     })
                 }),
                 inventory_identity: Arc::new(inventory_identity),
@@ -313,6 +345,7 @@ impl ProviderRegistry {
                 cleanup: None,
                 provider_type,
                 supports_inventory_refresh,
+                probed_context_limit: probed_limit_slot,
             },
         );
     }
@@ -348,7 +381,17 @@ impl ProviderRegistry {
     pub fn all_metadata_with_types(&self) -> Vec<(ProviderMetadata, ProviderType)> {
         self.entries
             .values()
-            .map(|e| (e.metadata.clone(), e.provider_type))
+            .map(|e| {
+                let mut metadata = e.metadata.clone();
+                if let Some(limit) = e.get_probed_context_limit() {
+                    for m in &mut metadata.known_models {
+                        if m.context_limit.is_none() {
+                            m.context_limit = Some(limit);
+                        }
+                    }
+                }
+                (metadata, e.provider_type)
+            })
             .collect()
     }
 

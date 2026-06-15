@@ -4,18 +4,18 @@ use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
 use goose_providers::images::ImageFormat;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use super::api_client::{ApiClient, AuthMethod};
 use super::base::{
-    ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata,
-    DEFAULT_PROVIDER_TIMEOUT_SECS,
+    ConfigKey, DEFAULT_PROVIDER_TIMEOUT_SECS, MessageStream, ModelInfo, Provider, ProviderDef,
+    ProviderMetadata,
 };
 use super::embedding::EmbeddingCapable;
 use super::openai_compatible::handle_response_openai_compat;
 use super::retry::ProviderRetry;
-use super::utils::{get_model, RequestLog};
+use super::utils::{RequestLog, get_model};
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use goose_providers::formats::openai::ModelConfigParams;
@@ -206,8 +206,8 @@ impl Provider for LiteLLMProvider {
         if config.context_limit.is_none() {
             if let Some(models) = self.cached_model_info.get() {
                 if let Some(info) = models.iter().find(|m| m.name == config.model_name) {
-                    if info.context_limit > 0 {
-                        config.context_limit = Some(info.context_limit);
+                    if info.context_limit.is_some_and(|l| l > 0) {
+                        config.context_limit = info.context_limit;
                     }
                 }
             }

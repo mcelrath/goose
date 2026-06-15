@@ -700,7 +700,7 @@ mod tests {
             models: vec![ModelInfo {
                 name: "test/model".to_string(),
                 resolved_model: None,
-                context_limit: 128_000,
+                context_limit: Some(128_000),
                 input_token_cost: None,
                 output_token_cost: None,
                 currency: None,
@@ -969,7 +969,7 @@ mod tests {
 
         assert_eq!(config.models.len(), 1);
         assert_eq!(config.models[0].name, "z-ai/glm-4.7");
-        assert_eq!(config.models[0].context_limit, 131072);
+        assert_eq!(config.models[0].context_limit, Some(131072));
     }
 
     #[test]

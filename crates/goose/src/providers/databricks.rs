@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 
 use super::api_client::{ApiClient, AuthMethod};
 use super::base::{
-    ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata,
-    DEFAULT_PROVIDER_TIMEOUT_SECS,
+    ConfigKey, DEFAULT_PROVIDER_TIMEOUT_SECS, MessageStream, ModelInfo, Provider, ProviderDef,
+    ProviderMetadata,
 };
 use super::databricks_auth::{DatabricksAuth, DatabricksAuthProvider};
 use super::embedding::EmbeddingCapable;
-use super::formats::databricks::{create_request_for_provider, DATABRICKS_PROVIDER_NAME};
+use super::formats::databricks::{DATABRICKS_PROVIDER_NAME, create_request_for_provider};
 use super::formats::openai_responses::create_responses_request;
 use super::openai_compatible::{
     handle_response_openai_compat, handle_status, map_http_error_to_provider_error, sanitize_url,
@@ -31,8 +31,8 @@ use crate::conversation::message::Message;
 use crate::instance_id::get_instance_id;
 use crate::model::ModelConfig;
 use crate::providers::retry::{
-    RetryConfig, DEFAULT_BACKOFF_MULTIPLIER, DEFAULT_INITIAL_RETRY_INTERVAL_MS,
-    DEFAULT_MAX_RETRIES, DEFAULT_MAX_RETRY_INTERVAL_MS,
+    DEFAULT_BACKOFF_MULTIPLIER, DEFAULT_INITIAL_RETRY_INTERVAL_MS, DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_RETRY_INTERVAL_MS, RetryConfig,
 };
 use goose_providers::errors::ProviderError;
 use rmcp::model::Tool;
@@ -475,7 +475,7 @@ impl DatabricksProvider {
         ModelInfo {
             name: info.name,
             resolved_model: info.upstream_model_name,
-            context_limit,
+            context_limit: Some(context_limit),
             input_token_cost: None,
             output_token_cost: None,
             currency: None,

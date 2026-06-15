@@ -141,11 +141,49 @@ async fn get_registry() -> &'static RwLock<ProviderRegistry> {
 }
 
 pub async fn providers() -> Vec<(ProviderMetadata, ProviderType)> {
+    probe_missing_context_limits().await;
     get_registry()
         .await
         .read()
         .unwrap()
         .all_metadata_with_types()
+}
+
+/// For configured declarative providers whose known_models have no context_limit,
+/// construct the provider (which probes /v1/models and caches the result).
+async fn probe_missing_context_limits() {
+    let registry = get_registry().await;
+    // Collect what needs probing before releasing the lock.
+    let to_probe: Vec<(String, String)> = {
+        let guard = registry.read().unwrap();
+        guard
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.get_probed_context_limit().is_none()
+                    && e.inventory_configured()
+                    && e.metadata()
+                        .known_models
+                        .iter()
+                        .any(|m| m.context_limit.is_none())
+            })
+            .map(|(name, e)| (name.clone(), e.metadata().default_model.clone()))
+            .collect()
+    };
+    // Probe each — the constructor writes the result to the shared Arc slot.
+    for (provider_name, default_model) in to_probe {
+        if let Ok(model) = ModelConfig::new(&default_model) {
+            let entry = registry
+                .read()
+                .unwrap()
+                .entries
+                .get(&provider_name)
+                .cloned();
+            if let Some(entry) = entry {
+                let _ = entry.create(model, vec![]).await;
+            }
+        }
+    }
 }
 
 pub async fn refresh_custom_providers() -> Result<()> {

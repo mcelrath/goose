@@ -698,6 +698,38 @@ impl ProviderInventoryService {
             .unwrap_or_else(|_| fallback_inventory_identity(provider_id))
             .into_identity()?;
 
+        // Use cached probe result; if absent and this configured provider has models with unknown
+        // context limits, trigger a probe now — the constructor writes the result to the slot.
+        let probed_limit = if entry.get_probed_context_limit().is_none()
+            && entry.inventory_configured()
+            && metadata
+                .known_models
+                .iter()
+                .any(|m| m.context_limit.is_none())
+        {
+            if let Ok(model) = crate::model::ModelConfig::new(metadata.default_model.as_str()) {
+                let _ = entry.create(model, vec![]).await;
+            }
+            entry.get_probed_context_limit()
+        } else {
+            entry.get_probed_context_limit()
+        };
+
+        let static_models = if let Some(limit) = probed_limit {
+            metadata
+                .known_models
+                .into_iter()
+                .map(|mut m| {
+                    if m.context_limit.is_none() {
+                        m.context_limit = Some(limit);
+                    }
+                    m
+                })
+                .collect()
+        } else {
+            metadata.known_models
+        };
+
         Ok(Some(ProviderDescriptor {
             provider_id: metadata.name.clone(),
             provider_name: metadata.display_name.clone(),
@@ -711,7 +743,7 @@ impl ProviderInventoryService {
             config_keys: metadata.config_keys.clone(),
             setup_steps: metadata.setup_steps.clone(),
             supports_refresh: entry.supports_inventory_refresh(),
-            static_models: metadata.known_models,
+            static_models,
             model_selection_hint: metadata.model_selection_hint,
         }))
     }
@@ -1057,7 +1089,7 @@ fn configured_models_to_inventory(
     let mut result: Vec<InventoryModel> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     for model in models {
-        let enriched = enriched_model(provider_family, &model.name, Some(model.context_limit));
+        let enriched = enriched_model(provider_family, &model.name, model.context_limit);
         if seen_names.insert(enriched.name.clone()) {
             result.push(enriched);
         }

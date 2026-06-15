@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use futures::Stream;
+use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
 use regex::Regex;
@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 /// before giving up. Individual providers may override this via their own config key.
 pub const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 600;
 
-use super::canonical::{map_to_canonical_model, CanonicalModelRegistry};
-use super::inventory::{default_inventory_identity, InventoryIdentityInput};
+use super::canonical::{CanonicalModelRegistry, map_to_canonical_model};
+use super::inventory::{InventoryIdentityInput, default_inventory_identity};
 use super::retry::RetryConfig;
 use crate::config::base::ConfigValue;
 use crate::config::{Config, ExtensionConfig, GooseMode};
-use crate::conversation::message::{Message, MessageContent};
 use crate::conversation::Conversation;
+use crate::conversation::message::{Message, MessageContent};
 use crate::model::ModelConfig;
 use crate::permission::PermissionConfirmation;
 use crate::utils::safe_truncate;
@@ -105,8 +105,9 @@ pub struct ModelInfo {
     /// The underlying model resolved from provider metadata, when the configured model is an alias or endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<String>,
-    /// The maximum context length this model supports
-    pub context_limit: usize,
+    /// The maximum context length this model supports; None means unknown (provider will probe)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<usize>,
     /// Cost per token for input in USD (optional)
     pub input_token_cost: Option<f64>,
     /// Cost per token for output in USD (optional)
@@ -126,7 +127,7 @@ impl ModelInfo {
         Self {
             name: name.into(),
             resolved_model: None,
-            context_limit,
+            context_limit: Some(context_limit),
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
@@ -145,7 +146,7 @@ impl ModelInfo {
         Self {
             name: name.into(),
             resolved_model: None,
-            context_limit,
+            context_limit: Some(context_limit),
             input_token_cost: Some(input_cost),
             output_token_cost: Some(output_cost),
             currency: Some("$".to_string()),
@@ -171,9 +172,11 @@ fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> Model
     ModelInfo {
         name: model_name.to_string(),
         resolved_model: None,
-        context_limit: ModelConfig::new_or_fail(model_name)
-            .with_canonical_limits(provider_name)
-            .context_limit(),
+        context_limit: Some(
+            ModelConfig::new_or_fail(model_name)
+                .with_canonical_limits(provider_name)
+                .context_limit(),
+        ),
         input_token_cost: None,
         output_token_cost: None,
         currency: None,
@@ -537,6 +540,13 @@ pub trait Provider: Send + Sync {
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         Ok(vec![])
+    }
+
+    /// Probe the provider's /v1/models endpoint for the active model's context window.
+    /// Returns None if the provider doesn't support probing or the model isn't found.
+    /// Called automatically after construction when context_limit is unset.
+    async fn probe_context_limit(&self) -> Option<usize> {
+        None
     }
 
     async fn fetch_supported_model_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -1082,20 +1092,20 @@ mod tests {
         let info = ModelInfo {
             name: "test-model".to_string(),
             resolved_model: None,
-            context_limit: 1000,
+            context_limit: Some(1000),
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
         };
-        assert_eq!(info.context_limit, 1000);
+        assert_eq!(info.context_limit, Some(1000));
 
         // Test equality
         let info2 = ModelInfo {
             name: "test-model".to_string(),
             resolved_model: None,
-            context_limit: 1000,
+            context_limit: Some(1000),
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
@@ -1108,7 +1118,7 @@ mod tests {
         let info3 = ModelInfo {
             name: "test-model".to_string(),
             resolved_model: None,
-            context_limit: 2000,
+            context_limit: Some(2000),
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
@@ -1122,7 +1132,7 @@ mod tests {
     fn test_model_info_with_cost() {
         let info = ModelInfo::with_cost("gpt-4o", 128000, 0.0000025, 0.00001);
         assert_eq!(info.name, "gpt-4o");
-        assert_eq!(info.context_limit, 128000);
+        assert_eq!(info.context_limit, Some(128000));
         assert_eq!(info.input_token_cost, Some(0.0000025));
         assert_eq!(info.output_token_cost, Some(0.00001));
         assert_eq!(info.currency, Some("$".to_string()));
