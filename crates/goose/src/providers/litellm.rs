@@ -4,18 +4,18 @@ use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
 use goose_providers::images::ImageFormat;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use super::api_client::{ApiClient, AuthMethod};
 use super::base::{
-    ConfigKey, DEFAULT_PROVIDER_TIMEOUT_SECS, MessageStream, ModelInfo, Provider, ProviderDef,
-    ProviderMetadata,
+    ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata,
+    DEFAULT_PROVIDER_TIMEOUT_SECS,
 };
 use super::embedding::EmbeddingCapable;
 use super::openai_compatible::handle_response_openai_compat;
 use super::retry::ProviderRetry;
-use super::utils::{RequestLog, get_model};
+use super::utils::{get_model, RequestLog};
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use goose_providers::formats::openai::ModelConfigParams;

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::Stream;
 use futures::future::BoxFuture;
+use futures::Stream;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
 use regex::Regex;
@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 /// before giving up. Individual providers may override this via their own config key.
 pub const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 600;
 
-use super::canonical::{CanonicalModelRegistry, map_to_canonical_model};
-use super::inventory::{InventoryIdentityInput, default_inventory_identity};
+use super::canonical::{map_to_canonical_model, CanonicalModelRegistry};
+use super::inventory::{default_inventory_identity, InventoryIdentityInput};
 use super::retry::RetryConfig;
 use crate::config::base::ConfigValue;
 use crate::config::{Config, ExtensionConfig, GooseMode};
-use crate::conversation::Conversation;
 use crate::conversation::message::{Message, MessageContent};
+use crate::conversation::Conversation;
 use crate::model::ModelConfig;
 use crate::permission::PermissionConfirmation;
 use crate::utils::safe_truncate;
