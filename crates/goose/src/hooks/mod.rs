@@ -340,6 +340,62 @@ impl HookManager {
         }
     }
 
+    /// Like [`Self::emit`], but collects and returns stdout from all hooks
+    /// concatenated. Intended for `SessionStart` context injection.
+    pub async fn emit_collect(&self, event: HookEvent, ctx: HookContext) -> String {
+        let Some(rules) = self.rules.get(&event) else {
+            return String::new();
+        };
+
+        let payload = match serde_json::to_string(&ctx) {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(event = %event, error = %err, "Failed to serialize hook context");
+                return String::new();
+            }
+        };
+
+        let mut collected = String::new();
+        for rule in rules {
+            if let Some(matcher) = &rule.matcher {
+                let target = ctx.matcher_context.as_deref().unwrap_or("");
+                if !matcher.is_match(target) {
+                    continue;
+                }
+            }
+            for action in &rule.actions {
+                let LoadedAction::Command { command, timeout } = action;
+                match run_command_hook(command, &rule.plugin_root, &payload, *timeout).await {
+                    Ok(o) if o.status.success() => {
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        if !out.trim().is_empty() {
+                            collected.push_str(&out);
+                        }
+                    }
+                    Ok(o) => {
+                        warn!(
+                            plugin = %rule.plugin_name,
+                            event = %event,
+                            command = %command,
+                            exit = ?o.status.code(),
+                            "Plugin hook failed",
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            plugin = %rule.plugin_name,
+                            event = %event,
+                            command = %command,
+                            error = %err,
+                            "Plugin hook failed",
+                        );
+                    }
+                }
+            }
+        }
+        collected
+    }
+
     /// Like [`Self::emit`], but stops at the first rule that denies the event
     /// and returns the denial. A hook denies by exiting with status code 2
     /// (reason on stderr) or by printing `{"decision":"block","reason":"..."}`
@@ -623,6 +679,30 @@ mod tests {
 
         let written = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(written.trim(), root.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn emit_collect_returns_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = write_plugin(
+            tmp.path(),
+            "p",
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo 'session context'"}]}]}}"#,
+        );
+        let mgr = make_manager(vec![DiscoveredPlugin {
+            name: "p".into(),
+            root,
+            scope: PluginScope::User,
+        }]);
+
+        let out = mgr
+            .emit_collect(
+                HookEvent::SessionStart,
+                HookContext::new(HookEvent::SessionStart, "s1"),
+            )
+            .await;
+
+        assert_eq!(out.trim(), "session context");
     }
 
     #[tokio::test]
