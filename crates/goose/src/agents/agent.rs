@@ -258,6 +258,9 @@ pub struct Agent {
     goal: Mutex<Option<String>>,
     grind: Mutex<Option<String>>,
     pending_steers: Mutex<HashMap<String, VecDeque<Message>>>,
+    /// Collected stdout from `SessionStart` hooks, keyed by session_id.
+    /// Applied once on the first `reply()` call via `with_agent_text`, then cleared.
+    session_start_context: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -390,6 +393,7 @@ impl Agent {
             goal: Mutex::new(None),
             grind: Mutex::new(None),
             pending_steers: Mutex::new(HashMap::new()),
+            session_start_context: Mutex::new(HashMap::new()),
         }
     }
 
@@ -456,6 +460,30 @@ impl Agent {
                 Self::stop_hook_context(session_id, last_assistant_message),
             )
             .await
+    }
+
+    /// Like [`Self::emit_hook`], but collects stdout from all matching
+    /// `SessionStart` hooks and stores it for injection on the first `reply()`
+    /// call for this session. The collected text is applied once via
+    /// `with_agent_text` (agent-visible, user-invisible) then discarded.
+    pub async fn emit_hook_collect_session_start(&self, session_id: &str) {
+        if !self
+            .hook_manager
+            .has_hooks(crate::hooks::HookEvent::SessionStart)
+        {
+            return;
+        }
+        let ctx = crate::hooks::HookContext::new(crate::hooks::HookEvent::SessionStart, session_id);
+        let collected = self
+            .hook_manager
+            .emit_collect(crate::hooks::HookEvent::SessionStart, ctx)
+            .await;
+        if !collected.trim().is_empty() {
+            self.session_start_context
+                .lock()
+                .await
+                .insert(session_id.to_string(), collected);
+        }
     }
 
     pub async fn steer(&self, session_id: &str, message: Message) {
@@ -1688,10 +1716,23 @@ impl Agent {
                     .await?;
             }
             Ok(None) => {
-                let msg = if injected_context.is_empty() {
+                let session_start = self
+                    .session_start_context
+                    .lock()
+                    .await
+                    .remove(&session_config.id)
+                    .unwrap_or_default();
+                let combined = if session_start.is_empty() {
+                    injected_context
+                } else if injected_context.is_empty() {
+                    session_start
+                } else {
+                    format!("{session_start}\n\n{injected_context}")
+                };
+                let msg = if combined.is_empty() {
                     user_message
                 } else {
-                    user_message.with_agent_text(injected_context)
+                    user_message.with_agent_text(combined)
                 };
                 session_manager
                     .add_message(&session_config.id, &msg)
