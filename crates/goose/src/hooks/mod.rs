@@ -129,6 +129,12 @@ struct RawHookAction {
     command: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
+    /// When true, the hook is launched as a detached background task and never
+    /// blocks the agent. Used by Claude Code's asyncRewake protocol; goose
+    /// honours the field so a shared dual-harness hooks.json does not stall
+    /// turns on a long-lived watcher command.
+    #[serde(default, rename = "asyncRewake")]
+    async_rewake: bool,
 }
 
 /// A loaded, plugin-bound hook rule ready to execute.
@@ -142,7 +148,17 @@ struct LoadedRule {
 
 #[derive(Debug, Clone)]
 enum LoadedAction {
-    Command { command: String, timeout: Duration },
+    Command {
+        command: String,
+        timeout: Duration,
+    },
+    /// Spawned as a detached background task; its exit code never blocks the
+    /// agent. Corresponds to `asyncRewake: true` in hooks.json (Claude Code
+    /// protocol).
+    AsyncRewakeCommand {
+        command: String,
+        timeout: Duration,
+    },
 }
 
 /// Context passed to a hook as JSON on stdin.
@@ -317,7 +333,13 @@ impl HookManager {
             }
 
             for action in &rule.actions {
-                let LoadedAction::Command { command, timeout } = action;
+                let (command, timeout) = match action {
+                    LoadedAction::Command { command, timeout } => (command, *timeout),
+                    LoadedAction::AsyncRewakeCommand { command, timeout } => {
+                        spawn_async_rewake_hook(command, &rule.plugin_root, &payload, *timeout);
+                        continue;
+                    }
+                };
                 debug!(
                     plugin = %rule.plugin_name,
                     event = %event,
@@ -328,7 +350,7 @@ impl HookManager {
                     command,
                     &rule.plugin_root,
                     &payload,
-                    *timeout,
+                    timeout,
                     self.use_login_shell_path,
                 )
                 .await
@@ -383,12 +405,18 @@ impl HookManager {
             }
 
             for action in &rule.actions {
-                let LoadedAction::Command { command, timeout } = action;
+                let (command, timeout) = match action {
+                    LoadedAction::Command { command, timeout } => (command, *timeout),
+                    LoadedAction::AsyncRewakeCommand { command, timeout } => {
+                        spawn_async_rewake_hook(command, &rule.plugin_root, &payload, *timeout);
+                        continue;
+                    }
+                };
                 let output = match run_command_hook(
                     command,
                     &rule.plugin_root,
                     &payload,
-                    *timeout,
+                    timeout,
                     self.use_login_shell_path,
                 )
                 .await
@@ -493,10 +521,17 @@ fn load_hooks_file(
                             let timeout = Duration::from_secs(
                                 raw_action.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
                             );
-                            actions.push(LoadedAction::Command {
-                                command: cmd,
-                                timeout,
-                            });
+                            if raw_action.async_rewake {
+                                actions.push(LoadedAction::AsyncRewakeCommand {
+                                    command: cmd,
+                                    timeout,
+                                });
+                            } else {
+                                actions.push(LoadedAction::Command {
+                                    command: cmd,
+                                    timeout,
+                                });
+                            }
                         }
                     }
                     other => {
@@ -523,6 +558,45 @@ fn load_hooks_file(
     }
 
     Ok(out)
+}
+
+/// Launch an `asyncRewake` hook as a detached background process. The hook
+/// never blocks the agent and its exit status is ignored; goose only needs to
+/// fire-and-forget it (Claude Code uses these as idle-wake signals). Uses a
+/// std thread + std::process::Command so the child is fully detached from the
+/// tokio runtime and survives the turn.
+fn spawn_async_rewake_hook(
+    raw_command: &str,
+    plugin_root: &Path,
+    payload: &str,
+    _timeout: Duration,
+) {
+    use std::io::Write;
+    let command = expand_plugin_root(raw_command, plugin_root);
+    let plugin_root = plugin_root.to_path_buf();
+    let payload = payload.to_string();
+    std::thread::spawn(move || {
+        let mut child = match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PLUGIN_ROOT", &plugin_root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                debug!(command = %command, error = %err, "asyncRewake hook spawn failed");
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(payload.as_bytes());
+        }
+        // Detach: dropping Child without wait() leaves the process running
+        // (std::process::Child::drop does not kill the child).
+    });
 }
 
 async fn run_command_hook(
