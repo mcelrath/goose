@@ -1569,7 +1569,7 @@ impl Agent {
 
         let message_text = user_message.as_concat_text();
 
-        if self
+        let injected_context = if self
             .hook_manager
             .has_hooks(crate::hooks::HookEvent::UserPromptSubmit)
         {
@@ -1579,9 +1579,11 @@ impl Agent {
             )
             .with_message(message_text.clone());
             self.hook_manager
-                .emit(crate::hooks::HookEvent::UserPromptSubmit, ctx)
-                .await;
-        }
+                .emit_collect(crate::hooks::HookEvent::UserPromptSubmit, ctx)
+                .await
+        } else {
+            String::new()
+        };
 
         let command_result = self
             .execute_command(&message_text, &session_config.id)
@@ -1686,8 +1688,13 @@ impl Agent {
                     .await?;
             }
             Ok(None) => {
+                let msg = if injected_context.is_empty() {
+                    user_message
+                } else {
+                    user_message.with_agent_text(injected_context)
+                };
                 session_manager
-                    .add_message(&session_config.id, &user_message)
+                    .add_message(&session_config.id, &msg)
                     .await?;
             }
         }
@@ -2066,6 +2073,21 @@ impl Agent {
                                 if num_tool_requests == 0 {
                                     let text = filtered_response.as_concat_text();
                                     if !text.is_empty() {
+                                        if self.hook_manager.has_hooks(
+                                            crate::hooks::HookEvent::AssistantResponse,
+                                        ) {
+                                            let ctx = crate::hooks::HookContext::new(
+                                                crate::hooks::HookEvent::AssistantResponse,
+                                                &session_config.id,
+                                            )
+                                            .with_message(text.clone());
+                                            self.hook_manager
+                                                .emit(
+                                                    crate::hooks::HookEvent::AssistantResponse,
+                                                    ctx,
+                                                )
+                                                .await;
+                                        }
                                         last_assistant_text.push_str(&text);
                                     }
                                     messages_to_add.push(response);
