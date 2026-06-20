@@ -204,6 +204,19 @@ const MarkdownContent = memo(function MarkdownContent({
   const intl = useIntl();
   const [processedContent, setProcessedContent] = useState(content);
   const [pendingLink, setPendingLink] = useState<{ protocol: string; href: string } | null>(null);
+  const [mathSingleDollar, setMathSingleDollar] = useState(false);
+
+  useEffect(() => {
+    Promise.all([
+      window.electron.getSetting('mathFontScale'),
+      window.electron.getSetting('mathSingleDollar'),
+    ]).then(([scale, singleDollar]) => {
+      if (typeof scale === 'number') {
+        document.documentElement.style.setProperty('--math-font-scale', String(scale));
+      }
+      if (typeof singleDollar === 'boolean') setMathSingleDollar(singleDollar);
+    });
+  }, []);
 
   useEffect(() => {
     try {
@@ -258,7 +271,7 @@ const MarkdownContent = memo(function MarkdownContent({
       >
         <ReactMarkdown
           urlTransform={customUrlTransform}
-          remarkPlugins={[remarkGfm, remarkBreaks, [remarkMath, { singleDollarTextMath: false }]]}
+          remarkPlugins={[remarkGfm, remarkBreaks, [remarkMath, { singleDollarTextMath: mathSingleDollar }]]}
           rehypePlugins={[
             [
               rehypeKatex,

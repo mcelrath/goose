@@ -4,6 +4,7 @@ import { SecurityToggle } from '../security/SecurityToggle';
 import { ResponseStylesSection } from '../response_styles/ResponseStylesSection';
 import { GoosehintsSection } from './GoosehintsSection';
 import { SpellcheckToggle } from './SpellcheckToggle';
+import { MathRenderingSettings } from './MathRenderingSettings';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../ui/card';
 import { defineMessages, useIntl } from '../../../i18n';
 
@@ -24,6 +25,14 @@ const i18n = defineMessages({
   responseStylesDescription: {
     id: 'chatSettings.responseStylesDescription',
     defaultMessage: 'Choose how Goose should format and style its responses',
+  },
+  mathTitle: {
+    id: 'chatSettings.mathTitle',
+    defaultMessage: 'Math Rendering',
+  },
+  mathDescription: {
+    id: 'chatSettings.mathDescription',
+    defaultMessage: 'Configure KaTeX LaTeX rendering for mathematical expressions',
   },
 });
 
@@ -62,6 +71,16 @@ export default function ChatSettingsSection() {
         </CardHeader>
         <CardContent className="px-2">
           <ResponseStylesSection />
+        </CardContent>
+      </Card>
+
+      <Card className="pb-2 rounded-lg">
+        <CardHeader className="pb-0">
+          <CardTitle className="">{intl.formatMessage(i18n.mathTitle)}</CardTitle>
+          <CardDescription>{intl.formatMessage(i18n.mathDescription)}</CardDescription>
+        </CardHeader>
+        <CardContent className="px-2">
+          <MathRenderingSettings />
         </CardContent>
       </Card>
 

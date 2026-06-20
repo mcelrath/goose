@@ -928,6 +928,24 @@ pre:has(> code.bg-inline-code) {
   animation: mcp-enter-fullscreen 200ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
+/* KaTeX math rendering */
+:root {
+  --math-font-scale: 1.1;
+}
+
+.katex {
+  font-size: calc(var(--math-font-scale) * 1em) !important;
+}
+
+/* Display math ($$...$$) must be block-centered; Tailwind prose can override
+   the inline text-align on the parent <p>, so force it here. */
+.katex-display {
+  display: block !important;
+  text-align: center !important;
+  margin: 0.75em 0 !important;
+  overflow-x: auto;
+}
+
 .mcp-app-container.mcp-enter-inline {
   animation: mcp-enter-inline 180ms cubic-bezier(0.2, 0, 0, 1) both;
 }

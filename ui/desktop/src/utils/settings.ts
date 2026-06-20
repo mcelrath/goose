@@ -47,6 +47,10 @@ export interface Settings {
   responseStyle: string;
   showPricing: boolean;
   seenAnnouncementIds: string[];
+
+  // Math / LaTeX rendering
+  mathFontScale: number;
+  mathSingleDollar: boolean;
 }
 
 export type SettingKey = keyof Settings;
@@ -87,6 +91,8 @@ export const defaultSettings: Settings = {
   responseStyle: 'concise',
   showPricing: true,
   seenAnnouncementIds: [],
+  mathFontScale: 1.1,
+  mathSingleDollar: false,
 };
 
 export function getKeyboardShortcuts(settings: Settings): KeyboardShortcuts {
