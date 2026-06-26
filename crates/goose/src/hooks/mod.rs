@@ -884,6 +884,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_collect_concatenates_stdout_and_skips_failing_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = write_plugin(
+            tmp.path(),
+            "p",
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf AAA"},{"type":"command","command":"sh -c 'printf BBB; exit 1'"},{"type":"command","command":"printf CCC"}]}]}}"#,
+        );
+        let mgr = make_manager(vec![DiscoveredPlugin {
+            name: "p".into(),
+            root,
+            scope: PluginScope::User,
+        }]);
+
+        let out = mgr
+            .emit_collect(
+                HookEvent::UserPromptSubmit,
+                HookContext::new(HookEvent::UserPromptSubmit, "s"),
+            )
+            .await;
+
+        assert!(out.contains("AAA"));
+        assert!(out.contains("CCC"));
+        assert!(
+            !out.contains("BBB"),
+            "stdout of a hook that exits non-zero must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_rewake_action_loaded_and_non_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = write_plugin(
+            tmp.path(),
+            "p",
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","asyncRewake":true,"command":"sleep 30"}]}]}}"#,
+        );
+        let mgr = make_manager(vec![DiscoveredPlugin {
+            name: "p".into(),
+            root,
+            scope: PluginScope::User,
+        }]);
+
+        let actions = &mgr.rules.get(&HookEvent::Stop).unwrap()[0].actions;
+        assert!(
+            matches!(actions[0], LoadedAction::AsyncRewakeCommand { .. }),
+            "asyncRewake:true must load as AsyncRewakeCommand"
+        );
+
+        // emit must return immediately — it must NOT await the 30s sleep.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mgr.emit(HookEvent::Stop, HookContext::new(HookEvent::Stop, "s")),
+        )
+        .await
+        .expect("emit must not block on an asyncRewake hook");
+    }
+
+    #[tokio::test]
     async fn stop_hook_emit_blocking_returns_denial() {
         let tmp = tempfile::tempdir().unwrap();
         let root = write_plugin(
