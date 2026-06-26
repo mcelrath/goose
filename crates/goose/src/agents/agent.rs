@@ -245,6 +245,9 @@ pub struct Agent {
     pub(super) frontend_tools: Mutex<HashMap<String, FrontendTool>>,
     pub(super) frontend_instructions: Mutex<Option<String>>,
     pub(super) prompt_manager: Mutex<PromptManager>,
+    /// Collected stdout from `SessionStart` hooks, keyed by session_id. Applied
+    /// once on the first `reply()` call via `with_agent_text`, then cleared.
+    session_start_context: Mutex<HashMap<String, String>>,
     pub tool_confirmation_router: ToolConfirmationRouter,
     pub(super) tool_result_tx: mpsc::Sender<(String, ToolResult<CallToolResult>)>,
     pub(super) tool_result_rx: ToolResultReceiver,
@@ -371,6 +374,7 @@ impl Agent {
             frontend_tools: Mutex::new(HashMap::new()),
             frontend_instructions: Mutex::new(None),
             prompt_manager: Mutex::new(PromptManager::new()),
+            session_start_context: Mutex::new(HashMap::new()),
             tool_confirmation_router: ToolConfirmationRouter::new(),
             tool_result_tx: tool_tx,
             tool_result_rx: Arc::new(Mutex::new(tool_rx)),
@@ -423,6 +427,30 @@ impl Agent {
         self.hook_manager
             .emit(event, crate::hooks::HookContext::new(event, session_id))
             .await;
+    }
+
+    /// Like [`Self::emit_hook`], but collects `SessionStart` hook stdout and
+    /// stores it for injection on the first `reply()` for this session. The
+    /// collected text is applied once via `with_agent_text` (agent-visible,
+    /// user-invisible) then discarded.
+    pub async fn emit_hook_collect_session_start(&self, session_id: &str) {
+        if !self
+            .hook_manager
+            .has_hooks(crate::hooks::HookEvent::SessionStart)
+        {
+            return;
+        }
+        let ctx = crate::hooks::HookContext::new(crate::hooks::HookEvent::SessionStart, session_id);
+        let collected = self
+            .hook_manager
+            .emit_collect(crate::hooks::HookEvent::SessionStart, ctx)
+            .await;
+        if !collected.trim().is_empty() {
+            self.session_start_context
+                .lock()
+                .await
+                .insert(session_id.to_string(), collected);
+        }
     }
 
     fn stop_hook_context(
@@ -1688,11 +1716,19 @@ impl Agent {
                     .await?;
             }
             Ok(None) => {
-                let msg = if injected_context.is_empty() {
-                    user_message
-                } else {
-                    user_message.with_agent_text(injected_context)
-                };
+                let session_start = self
+                    .session_start_context
+                    .lock()
+                    .await
+                    .remove(&session_config.id)
+                    .unwrap_or_default();
+                let mut msg = user_message;
+                if !session_start.is_empty() {
+                    msg = msg.with_agent_text(session_start);
+                }
+                if !injected_context.is_empty() {
+                    msg = msg.with_agent_text(injected_context);
+                }
                 session_manager
                     .add_message(&session_config.id, &msg)
                     .await?;
