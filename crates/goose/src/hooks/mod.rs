@@ -129,6 +129,11 @@ struct RawHookAction {
     command: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
+    /// When true, the hook is launched as a detached background task and never
+    /// blocks the agent (Open Plugins `asyncRewake` protocol — used for
+    /// long-hold idle watchers that wake the session mid-turn).
+    #[serde(default, rename = "asyncRewake")]
+    async_rewake: bool,
 }
 
 /// A loaded, plugin-bound hook rule ready to execute.
@@ -143,6 +148,9 @@ struct LoadedRule {
 #[derive(Debug, Clone)]
 enum LoadedAction {
     Command { command: String, timeout: Duration },
+    /// Spawned as a detached background task; its exit never blocks the agent.
+    /// Corresponds to `asyncRewake: true` in `hooks.json`.
+    AsyncRewakeCommand { command: String, timeout: Duration },
 }
 
 /// Context passed to a hook as JSON on stdin.
@@ -315,7 +323,13 @@ impl HookManager {
                 }
             }
             for action in &rule.actions {
-                let LoadedAction::Command { command, timeout } = action;
+                let (command, timeout) = match action {
+                    LoadedAction::Command { command, timeout } => (command, timeout),
+                    LoadedAction::AsyncRewakeCommand { command, timeout } => {
+                        spawn_async_rewake_hook(command, &rule.plugin_root, &payload, *timeout);
+                        continue;
+                    }
+                };
                 match run_command_hook(
                     command,
                     &rule.plugin_root,
@@ -383,7 +397,13 @@ impl HookManager {
             }
 
             for action in &rule.actions {
-                let LoadedAction::Command { command, timeout } = action;
+                let (command, timeout) = match action {
+                    LoadedAction::Command { command, timeout } => (command, timeout),
+                    LoadedAction::AsyncRewakeCommand { command, timeout } => {
+                        spawn_async_rewake_hook(command, &rule.plugin_root, &payload, *timeout);
+                        continue;
+                    }
+                };
                 debug!(
                     plugin = %rule.plugin_name,
                     event = %event,
@@ -449,7 +469,13 @@ impl HookManager {
             }
 
             for action in &rule.actions {
-                let LoadedAction::Command { command, timeout } = action;
+                let (command, timeout) = match action {
+                    LoadedAction::Command { command, timeout } => (command, timeout),
+                    LoadedAction::AsyncRewakeCommand { command, timeout } => {
+                        spawn_async_rewake_hook(command, &rule.plugin_root, &payload, *timeout);
+                        continue;
+                    }
+                };
                 let output = match run_command_hook(
                     command,
                     &rule.plugin_root,
@@ -559,9 +585,16 @@ fn load_hooks_file(
                             let timeout = Duration::from_secs(
                                 raw_action.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
                             );
-                            actions.push(LoadedAction::Command {
-                                command: cmd,
-                                timeout,
+                            actions.push(if raw_action.async_rewake {
+                                LoadedAction::AsyncRewakeCommand {
+                                    command: cmd,
+                                    timeout,
+                                }
+                            } else {
+                                LoadedAction::Command {
+                                    command: cmd,
+                                    timeout,
+                                }
                             });
                         }
                     }
@@ -589,6 +622,43 @@ fn load_hooks_file(
     }
 
     Ok(out)
+}
+
+/// Spawn an `asyncRewake` hook as a fully detached background process.
+///
+/// Unlike [`run_command_hook`], this deliberately bypasses [`hook_command`]:
+/// it does NOT apply the flatpak-spawn wrap, nor the login-shell PATH repair
+/// (`use_login_shell_path`). A long-hold idle watcher (e.g. kb's
+/// `bridge-watch-rewake`) must outlive the turn and never block the agent, so
+/// it runs via a raw detached `std::process::Command` on its own thread; the
+/// `Child` is dropped without `wait()`, leaving the process running. The
+/// timeout is intentionally ignored — these hooks self-terminate.
+fn spawn_async_rewake_hook(raw_command: &str, plugin_root: &Path, payload: &str, _timeout: Duration) {
+    use std::io::Write;
+    let command = expand_plugin_root(raw_command, plugin_root);
+    let plugin_root = plugin_root.to_path_buf();
+    let payload = payload.to_string();
+    std::thread::spawn(move || {
+        let mut child = match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PLUGIN_ROOT", &plugin_root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                debug!(command = %command, error = %err, "asyncRewake hook spawn failed");
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(payload.as_bytes());
+        }
+        // Detach: dropping Child without wait() leaves the process running.
+    });
 }
 
 async fn run_command_hook(
