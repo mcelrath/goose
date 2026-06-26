@@ -3755,6 +3755,125 @@ exit 0
             .collect()
     }
 
+    /// Records whether the sentinels ever reached the provider (i.e. the model).
+    struct SentinelCapturingProvider {
+        saw_ups: Arc<std::sync::atomic::AtomicBool>,
+        saw_ss: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for SentinelCapturingProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _session_id: &str,
+            _system_prompt: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let all: String = messages.iter().map(Message::as_concat_text).collect();
+            if all.contains("UPS_SENTINEL_7Q") {
+                self.saw_ups.store(true, Ordering::SeqCst);
+            }
+            if all.contains("SS_SENTINEL_7Q") {
+                self.saw_ss.store(true, Ordering::SeqCst);
+            }
+            let message = Message::assistant().with_text("ok");
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_name(&self) -> &str {
+            "sentinel-capturing"
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_stdout_injected_as_agent_visible_context() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let plugin_dir = temp_dir.path().join("sentinel-plugin");
+        std::fs::create_dir_all(plugin_dir.join("hooks"))?;
+        std::fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            r#"{"hooks":{
+                "UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf UPS_SENTINEL_7Q"}]}],
+                "SessionStart":[{"hooks":[{"type":"command","command":"printf SS_SENTINEL_7Q"}]}]
+            }}"#,
+        )?;
+
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![DiscoveredPlugin {
+            name: "sentinel-plugin".into(),
+            root: plugin_dir,
+            scope: PluginScope::Project,
+        }]);
+
+        let saw_ups = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_ss = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(SentinelCapturingProvider {
+            saw_ups: saw_ups.clone(),
+            saw_ss: saw_ss.clone(),
+        });
+        let (agent, session_id) =
+            create_test_agent(temp_dir.path().join("data"), hook_manager, provider).await?;
+
+        // CLI fires this at session start; it collects SessionStart hook stdout
+        // for injection on the first reply.
+        agent.emit_hook_collect_session_start(&session_id).await;
+
+        let session_config = SessionConfig {
+            id: session_id.clone(),
+            schedule_id: None,
+            max_turns: Some(3),
+            retry_config: None,
+        };
+        let reply_stream = agent
+            .reply(Message::user().with_text("hello"), session_config, None)
+            .await?;
+        tokio::pin!(reply_stream);
+        while let Some(event) = reply_stream.next().await {
+            event?;
+        }
+
+        // The model must see both injected hook outputs.
+        assert!(
+            saw_ups.load(Ordering::SeqCst),
+            "UserPromptSubmit hook stdout must reach the provider"
+        );
+        assert!(
+            saw_ss.load(Ordering::SeqCst),
+            "SessionStart hook stdout must reach the provider on first reply"
+        );
+
+        // ...but they must NOT be visible to the user.
+        let conversation = agent
+            .config
+            .session_manager
+            .get_session(&session_id, true)
+            .await?
+            .conversation
+            .expect("conversation");
+        let user_message = conversation
+            .messages()
+            .iter()
+            .find(|m| m.role == rmcp::model::Role::User)
+            .expect("a user message");
+        let user_visible: String = user_message
+            .content
+            .iter()
+            .filter_map(|c| c.filter_for_audience(rmcp::model::Role::User))
+            .filter_map(|c| c.as_text().map(str::to_string))
+            .collect();
+        assert!(
+            user_visible.contains("hello"),
+            "the user's own text stays user-visible"
+        );
+        assert!(
+            !user_visible.contains("UPS_SENTINEL_7Q") && !user_visible.contains("SS_SENTINEL_7Q"),
+            "injected hook context must be agent-only, never shown to the user"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stop_hook_block_cap_allows_configured_consecutive_blocks_then_overrides() -> Result<()>
     {
