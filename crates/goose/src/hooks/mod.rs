@@ -289,6 +289,72 @@ impl HookManager {
         self.rules.get(&event).is_some_and(|r| !r.is_empty())
     }
 
+    /// Like [`Self::emit`], but collects and returns the concatenated stdout of
+    /// every matching hook. A hook that exits non-zero is logged and its output
+    /// skipped. Intended for events whose output is fed back to the agent as
+    /// context (e.g. `UserPromptSubmit`, `SessionStart`).
+    pub async fn emit_collect(&self, event: HookEvent, ctx: HookContext) -> String {
+        let Some(rules) = self.rules.get(&event) else {
+            return String::new();
+        };
+
+        let payload = match serde_json::to_string(&ctx) {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(event = %event, error = %err, "Failed to serialize hook context");
+                return String::new();
+            }
+        };
+
+        let mut collected = String::new();
+        for rule in rules {
+            if let Some(matcher) = &rule.matcher {
+                let target = ctx.matcher_context.as_deref().unwrap_or("");
+                if !matcher.is_match(target) {
+                    continue;
+                }
+            }
+            for action in &rule.actions {
+                let LoadedAction::Command { command, timeout } = action;
+                match run_command_hook(
+                    command,
+                    &rule.plugin_root,
+                    &payload,
+                    *timeout,
+                    self.use_login_shell_path,
+                )
+                .await
+                {
+                    Ok(o) if o.status.success() => {
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        if !out.trim().is_empty() {
+                            collected.push_str(&out);
+                        }
+                    }
+                    Ok(o) => {
+                        warn!(
+                            plugin = %rule.plugin_name,
+                            event = %event,
+                            command = %command,
+                            exit = ?o.status.code(),
+                            "Plugin hook failed",
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            plugin = %rule.plugin_name,
+                            event = %event,
+                            command = %command,
+                            error = %err,
+                            "Plugin hook failed",
+                        );
+                    }
+                }
+            }
+        }
+        collected
+    }
+
     /// Fire all rules whose matcher matches the event context. Errors from
     /// individual hooks are logged but never propagated — a misbehaving hook
     /// MUST NOT crash the host tool.

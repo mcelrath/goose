@@ -855,6 +855,24 @@ impl Message {
         ))
     }
 
+    /// Add text content visible only to the agent, not the user.
+    ///
+    /// Uses an audience annotation of `[Role::Assistant]` so `filter_for_audience`
+    /// strips it when filtering for the user side, while it is still sent to the
+    /// provider. Used for hook-injected context (e.g. plugin hook stdout).
+    pub fn with_agent_text<S: Into<String>>(self, text: S) -> Self {
+        let raw_text = text.into();
+        let sanitized_text = sanitize_unicode_tags(&raw_text);
+
+        self.with_content(MessageContent::Text(
+            RawTextContent {
+                text: sanitized_text,
+                meta: None,
+            }
+            .with_audience(vec![Role::Assistant]),
+        ))
+    }
+
     /// Add image content to the message
     pub fn with_image<S: Into<String>, T: Into<String>>(self, data: S, mime_type: T) -> Self {
         self.with_content(MessageContent::image(data, mime_type))
