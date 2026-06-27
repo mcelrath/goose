@@ -2116,6 +2116,19 @@ impl Agent {
                                 if num_tool_requests == 0 {
                                     let text = filtered_response.as_concat_text();
                                     if !text.is_empty() {
+                                        if self
+                                            .hook_manager
+                                            .has_hooks(crate::hooks::HookEvent::AssistantResponse)
+                                        {
+                                            let ctx = crate::hooks::HookContext::new(
+                                                crate::hooks::HookEvent::AssistantResponse,
+                                                &session_config.id,
+                                            )
+                                            .with_message(text.clone());
+                                            self.hook_manager
+                                                .emit(crate::hooks::HookEvent::AssistantResponse, ctx)
+                                                .await;
+                                        }
                                         last_assistant_text.push_str(&text);
                                     }
                                     messages_to_add.push(response);
@@ -3870,6 +3883,153 @@ exit 0
         assert!(
             !user_visible.contains("UPS_SENTINEL_7Q") && !user_visible.contains("SS_SENTINEL_7Q"),
             "injected hook context must be agent-only, never shown to the user"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assistant_response_hook_fires_with_settled_response_text() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let plugin_dir = temp_dir.path().join("ar-plugin");
+        std::fs::create_dir_all(plugin_dir.join("hooks"))?;
+        let ar_log = temp_dir.path().join("ar.log");
+        std::fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            format!(
+                r#"{{"hooks":{{"AssistantResponse":[{{"hooks":[{{"type":"command","command":"sh -c 'cat >> {}'"}}]}}]}}}}"#,
+                ar_log.display()
+            ),
+        )?;
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![DiscoveredPlugin {
+            name: "ar-plugin".into(),
+            root: plugin_dir,
+            scope: PluginScope::Project,
+        }]);
+        let provider = Arc::new(CountingTextProvider::new());
+        let (agent, session_id) =
+            create_test_agent(temp_dir.path().join("data"), hook_manager, provider).await?;
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(3),
+            retry_config: None,
+        };
+        let reply_stream = agent
+            .reply(Message::user().with_text("hi"), session_config, None)
+            .await?;
+        tokio::pin!(reply_stream);
+        while let Some(event) = reply_stream.next().await {
+            event?;
+        }
+
+        // The AssistantResponse hook received the settled response text on stdin.
+        let captured = std::fs::read_to_string(&ar_log).unwrap_or_default();
+        assert!(
+            captured.contains("provider response 0"),
+            "AssistantResponse hook must fire carrying the settled response text; got: {captured}"
+        );
+        Ok(())
+    }
+
+    struct ToolThenTextProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for ToolThenTextProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _session_id: &str,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let c = self.calls.fetch_add(1, Ordering::SeqCst);
+            let message = if c == 0 {
+                Message::assistant().with_tool_request(
+                    "call_0",
+                    Ok(rmcp::model::CallToolRequestParams::new("noop")),
+                )
+            } else {
+                Message::assistant().with_text("done")
+            };
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_name(&self) -> &str {
+            "tool-then-text"
+        }
+    }
+
+    #[tokio::test]
+    async fn steered_message_carries_hook_injection() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let plugin_dir = temp_dir.path().join("steer-plugin");
+        std::fs::create_dir_all(plugin_dir.join("hooks"))?;
+        std::fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf STEER_SENTINEL_K3"}]}]}}"#,
+        )?;
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![DiscoveredPlugin {
+            name: "steer-plugin".into(),
+            root: plugin_dir,
+            scope: PluginScope::Project,
+        }]);
+        let provider = Arc::new(ToolThenTextProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (agent, session_id) =
+            create_test_agent(temp_dir.path().join("data"), hook_manager, provider).await?;
+
+        // Queue a steer; it is drained mid-turn after the tool batch, where the
+        // UserPromptSubmit hook fires and its stdout is injected onto the steer.
+        agent
+            .steer(&session_id, Message::user().with_text("STEER_BODY_ZZ"))
+            .await;
+
+        let session_config = SessionConfig {
+            id: session_id.clone(),
+            schedule_id: None,
+            max_turns: Some(5),
+            retry_config: None,
+        };
+        let reply_stream = agent
+            .reply(Message::user().with_text("go"), session_config, None)
+            .await?;
+        tokio::pin!(reply_stream);
+        while let Some(event) = reply_stream.next().await {
+            event?;
+        }
+
+        let conversation = agent
+            .config
+            .session_manager
+            .get_session(&session_id, true)
+            .await?
+            .conversation
+            .expect("conversation");
+        let steer_msg = conversation
+            .messages()
+            .iter()
+            .find(|m| m.as_concat_text().contains("STEER_BODY_ZZ"))
+            .expect("the drained steer message must be in the conversation");
+
+        assert!(
+            steer_msg.as_concat_text().contains("STEER_SENTINEL_K3"),
+            "steered message must carry the injected UserPromptSubmit hook output (agent view)"
+        );
+        let user_visible: String = steer_msg
+            .content
+            .iter()
+            .filter_map(|c| c.filter_for_audience(rmcp::model::Role::User))
+            .filter_map(|c| c.as_text().map(str::to_string))
+            .collect();
+        assert!(
+            user_visible.contains("STEER_BODY_ZZ") && !user_visible.contains("STEER_SENTINEL_K3"),
+            "steer body stays user-visible; injected hook output stays agent-only"
         );
         Ok(())
     }

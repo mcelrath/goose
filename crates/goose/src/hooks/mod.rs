@@ -59,6 +59,13 @@ pub enum HookEvent {
     BeforeShellExecution,
     AfterShellExecution,
     Stop,
+    /// Fires once per settled assistant response (no pending tool calls), after
+    /// tool-call resolution. The `message` field of [`HookContext`] carries the
+    /// full response text. Observe-only: fired via [`HookManager::emit`]
+    /// (non-blocking, stdout ignored) so a hook can match the assistant's own
+    /// analysis against external context (e.g. kb prior-art) and surface it on
+    /// the next turn. MUST NOT block.
+    AssistantResponse,
 }
 
 impl HookEvent {
@@ -75,6 +82,7 @@ impl HookEvent {
             HookEvent::BeforeShellExecution => "BeforeShellExecution",
             HookEvent::AfterShellExecution => "AfterShellExecution",
             HookEvent::Stop => "Stop",
+            HookEvent::AssistantResponse => "AssistantResponse",
         }
     }
 
@@ -91,6 +99,7 @@ impl HookEvent {
             "BeforeShellExecution" => HookEvent::BeforeShellExecution,
             "AfterShellExecution" => HookEvent::AfterShellExecution,
             "Stop" => HookEvent::Stop,
+            "AssistantResponse" => HookEvent::AssistantResponse,
             _ => return None,
         })
     }
