@@ -27,10 +27,22 @@ import {
   CreditsExhaustedNotification,
   getCreditsExhaustedNotification,
 } from './context_management/CreditsExhaustedNotification';
-import { NotificationEvent } from '../types/message';
+import {
+  NotificationEvent,
+  getToolRequests,
+  getToolResponses,
+  getAnyToolConfirmationData,
+  getPendingToolConfirmationIds,
+  ToolConfirmationData,
+  ToolResponseMessageContent,
+} from '../types/message';
 import LoadingGoose from './LoadingGoose';
 import { ChatType } from '../types/chat';
-import { identifyConsecutiveToolCalls, isInChain } from '../utils/toolCallChaining';
+import {
+  identifyConsecutiveToolCalls,
+  isInChain,
+  shouldHideTimestamp,
+} from '../utils/toolCallChaining';
 import { getModelDisplayName } from './settings/models/predefinedModelsUtils';
 
 const i18n = defineMessages({
@@ -232,6 +244,33 @@ export default function ProgressiveMessageList({
   // Detect tool call chains
   const toolCallChains = useMemo(() => identifyConsecutiveToolCalls(messages), [messages]);
 
+  // List-level facts derived ONCE and handed to each GooseMessage, so leaves no
+  // longer each re-scan the whole conversation per render (was O(N^2)/render).
+  // Keyed by tool-request id, which is unique per tool call.
+  const messageDerived = useMemo(() => {
+    const toolResponsesByRequestId = new Map<string, ToolResponseMessageContent>();
+    const toolConfirmationByRequestId = new Map<string, ToolConfirmationData>();
+    const toolRequestIds = new Set<string>();
+    for (const message of messages) {
+      for (const response of getToolResponses(message)) {
+        toolResponsesByRequestId.set(response.id, response);
+      }
+      const confirmation = getAnyToolConfirmationData(message);
+      if (confirmation) {
+        toolConfirmationByRequestId.set(confirmation.id, confirmation);
+      }
+      for (const request of getToolRequests(message)) {
+        toolRequestIds.add(request.id);
+      }
+    }
+    return {
+      toolResponsesByRequestId,
+      toolConfirmationByRequestId,
+      toolRequestIds,
+      pendingConfirmationIds: getPendingToolConfirmationIds(messages),
+    };
+  }, [messages]);
+
   // Render messages up to the current rendered count
   const renderMessages = useCallback(() => {
     const messagesToRender = messages.slice(0, renderedCount);
@@ -271,15 +310,17 @@ export default function ProgressiveMessageList({
         const previousResolvedModel = currentResolvedModel ? getPreviousResolvedModel(index) : null;
         const showModelChangeDisclosure = Boolean(
           currentResolvedModel &&
-            previousResolvedModel &&
-            currentResolvedModel !== previousResolvedModel
+          previousResolvedModel &&
+          currentResolvedModel !== previousResolvedModel
         );
 
         const messageKey = message.id ?? `msg-${index}-${message.created}`;
 
         return (
           <Fragment key={messageKey}>
-            {showModelChangeDisclosure && currentResolvedModel && previousResolvedModel &&
+            {showModelChangeDisclosure &&
+              currentResolvedModel &&
+              previousResolvedModel &&
               renderModelChangeDisclosure(previousResolvedModel, currentResolvedModel)}
             <div
               className={`relative ${index === 0 ? 'mt-0' : 'mt-4'} ${isUser ? 'user' : 'assistant'} ${messageIsInChain ? 'in-chain' : ''}`}
@@ -293,7 +334,6 @@ export default function ProgressiveMessageList({
                 <GooseMessage
                   sessionId={chat.sessionId}
                   message={message}
-                  messages={messages}
                   append={append}
                   toolCallNotifications={toolCallNotifications}
                   isStreaming={
@@ -302,6 +342,11 @@ export default function ProgressiveMessageList({
                     index === messagesToRender.length - 1 &&
                     message.role === 'assistant'
                   }
+                  hideTimestamp={shouldHideTimestamp(index, toolCallChains)}
+                  toolResponsesByRequestId={messageDerived.toolResponsesByRequestId}
+                  toolConfirmationByRequestId={messageDerived.toolConfirmationByRequestId}
+                  pendingConfirmationIds={messageDerived.pendingConfirmationIds}
+                  toolRequestIds={messageDerived.toolRequestIds}
                   submitElicitationResponse={submitElicitationResponse}
                 />
               )}
@@ -321,6 +366,7 @@ export default function ProgressiveMessageList({
     isStreamingMessage,
     onMessageUpdate,
     toolCallChains,
+    messageDerived,
     submitElicitationResponse,
     getPreviousResolvedModel,
     getResolvedModel,
