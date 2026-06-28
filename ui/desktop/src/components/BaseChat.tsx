@@ -77,6 +77,7 @@ export default function BaseChat({
   const [hasStartedUsingRecipe, setHasStartedUsingRecipe] = React.useState(false);
   const [hasNotAcceptedRecipe, setHasNotAcceptedRecipe] = useState<boolean>();
   const [hasRecipeSecurityWarnings, setHasRecipeSecurityWarnings] = useState(false);
+  const [searchActive, setSearchActive] = useState(false);
   const isMobile = useIsMobile();
   const navContext = useNavigationContextSafe();
   const setView = useNavigation();
@@ -246,20 +247,12 @@ export default function BaseChat({
   // Track if this is the initial render for session resuming
   const initialRenderRef = useRef(true);
 
-  // Auto-scroll when messages are loaded (for session resuming)
+  // Initial positioning on load is handled by ScrollArea, which opens at the
+  // bottom with no animation; streaming follow is handled by its auto-scroll.
+  // Nothing to scroll here on render-complete — just mark the first render done.
   const handleRenderingComplete = React.useCallback(() => {
-    // Only force scroll on the very first render
-    if (initialRenderRef.current && messages.length > 0) {
-      initialRenderRef.current = false;
-      if (scrollRef.current?.scrollToBottom) {
-        scrollRef.current.scrollToBottom();
-      }
-    } else if (scrollRef.current?.isFollowing) {
-      if (scrollRef.current?.scrollToBottom) {
-        scrollRef.current.scrollToBottom();
-      }
-    }
-  }, [messages.length]);
+    initialRenderRef.current = false;
+  }, []);
 
   // Listen for global scroll-to-bottom requests (e.g., from MCP UI prompt actions)
   useEffect(() => {
@@ -445,13 +438,15 @@ export default function BaseChat({
 
             {messages.length > 0 || recipe ? (
               <>
-                <SearchView>
+                <SearchView onSearchActiveChange={setSearchActive}>
                   <ProgressiveMessageList
                     messages={messages}
                     chat={{ sessionId }}
+                    scrollAreaRef={scrollRef}
                     toolCallNotifications={toolCallNotifications}
                     append={(text: string) => handleSubmit({ msg: text, images: [] })}
                     isUserMessage={(m: Message) => m.role === 'user'}
+                    searchActive={searchActive}
                     isStreamingMessage={chatState !== ChatState.Idle}
                     onRenderingComplete={handleRenderingComplete}
                     onMessageUpdate={onMessageUpdate}

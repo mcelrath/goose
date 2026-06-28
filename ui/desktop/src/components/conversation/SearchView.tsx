@@ -27,6 +27,10 @@ interface SearchViewProps {
   /** Highlight matches in the content via the find-in-page highlighter (default: true).
    * Set false when the search acts as a list filter, so the term only drives onSearch. */
   highlightMatches?: boolean;
+  /** Called when the search bar opens (true) or closes (false). Lets a windowed
+   * message list expand to its full history while search is open so matches in
+   * not-yet-mounted messages are reachable. */
+  onSearchActiveChange?: (active: boolean) => void;
 }
 
 interface SearchContainerElement extends HTMLDivElement {
@@ -48,6 +52,7 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
   showCaseSensitive = true,
   showNavigation = true,
   highlightMatches = true,
+  onSearchActiveChange,
 }) => {
   const [isSearchVisible, setIsSearchVisible] = useState(false);
   const [initialSearchTerm, setInitialSearchTerm] = useState('');
@@ -298,6 +303,12 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
     // Clear search when closing
     onSearch?.('', false);
   }, [onSearch]);
+
+  // Notify the parent when search opens/closes so a windowed message list can
+  // expand to full history (and reachable matches) while search is active.
+  useEffect(() => {
+    onSearchActiveChange?.(isSearchVisible);
+  }, [isSearchVisible, onSearchActiveChange]);
 
   // Clean up highlighter on unmount
   useEffect(() => {

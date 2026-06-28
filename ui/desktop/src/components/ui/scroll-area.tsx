@@ -45,6 +45,7 @@ const ScrollArea = React.forwardRef<ScrollAreaHandle, ScrollAreaProps>(
     const lastScrollHeightRef = React.useRef(0);
     const isActivelyScrollingRef = React.useRef(false);
     const scrollTimeoutRef = React.useRef<number | null>(null);
+    const didInitialScrollRef = React.useRef(false);
 
     const BOTTOM_SCROLL_THRESHOLD = 200;
 
@@ -146,6 +147,20 @@ const ScrollArea = React.forwardRef<ScrollAreaHandle, ScrollAreaProps>(
       }
     }, [isAtBottom, isFollowing, onScrollChange, handleScrollProp]);
 
+    // Start at the bottom on first load with no visible scroll: position the
+    // viewport before the first paint (layout effect), once, as soon as there is
+    // content tall enough to scroll. No animation — the pane simply opens at the
+    // latest message.
+    React.useLayoutEffect(() => {
+      if (didInitialScrollRef.current || !autoScroll) return;
+      const viewport = viewportRef.current;
+      if (viewport && viewport.scrollHeight > viewport.clientHeight) {
+        viewport.scrollTop = viewport.scrollHeight;
+        lastScrollHeightRef.current = viewport.scrollHeight;
+        didInitialScrollRef.current = true;
+      }
+    }, [children, autoScroll]);
+
     // Auto-scroll when content changes and user is following
     React.useEffect(() => {
       if (!autoScroll || !viewportRef.current) return;
@@ -164,12 +179,14 @@ const ScrollArea = React.forwardRef<ScrollAreaHandle, ScrollAreaProps>(
         !userScrolledUpRef.current &&
         !isActivelyScrollingRef.current
       ) {
-        // Use requestAnimationFrame to ensure DOM has updated
+        // Use requestAnimationFrame to ensure DOM has updated. Use 'auto' (not
+        // 'smooth') so rapid streaming updates don't stack overlapping smooth
+        // scroll animations.
         requestAnimationFrame(() => {
           if (viewportRef.current && !isActivelyScrollingRef.current) {
             viewportRef.current.scrollTo({
               top: viewportRef.current.scrollHeight,
-              behavior: 'smooth',
+              behavior: 'auto',
             });
           }
         });

@@ -1,20 +1,28 @@
 /**
  * ProgressiveMessageList Component
  *
- * A performance-optimized message list that renders messages progressively
- * to prevent UI blocking when loading long chat sessions. This component
- * renders messages in batches with a loading indicator, maintaining full
- * compatibility with the search functionality.
+ * A performance-optimized message list that renders only the most recent
+ * messages on mount (tail-first windowing) and loads older messages upward as
+ * the user scrolls toward the top. This keeps opening a long (multi-compaction)
+ * conversation fast: the entire history is never mounted top-down at once.
  *
  * Key Features:
- * - Progressive rendering in configurable batches
- * - Loading indicator during batch processing
+ * - Tail-first windowing: render the recent tail, grow the window upward on scroll
+ * - Window expands to the full history while in-page search is open, so search
+ *   can reach every message
+ * - Anchors scroll position when older messages are prepended (no view jump)
  * - Maintains search functionality compatibility
- * - Smooth user experience with responsive UI
- * - Configurable batch size and delay
  */
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { defineMessages, useIntl } from '../i18n';
 import { Message, SystemNotificationContent } from '../api';
 import GooseMessage from './GooseMessage';
@@ -36,8 +44,8 @@ import {
   ToolConfirmationData,
   ToolResponseMessageContent,
 } from '../types/message';
-import LoadingGoose from './LoadingGoose';
 import { ChatType } from '../types/chat';
+import type { ScrollAreaHandle } from './ui/scroll-area';
 import {
   identifyConsecutiveToolCalls,
   isInChain,
@@ -46,29 +54,31 @@ import {
 import { getModelDisplayName } from './settings/models/predefinedModelsUtils';
 
 const i18n = defineMessages({
-  loadingMessages: {
-    id: 'progressiveMessageList.loadingMessages',
-    defaultMessage: 'Loading messages... ({renderedCount}/{totalCount})',
-  },
-  searchHint: {
-    id: 'progressiveMessageList.searchHint',
-    defaultMessage: 'Press Cmd/Ctrl+F to load all messages immediately for search',
-  },
   modelChanged: {
     id: 'progressiveMessageList.modelChanged',
     defaultMessage: 'Model changed: {previousModel} → {currentModel}',
   },
 });
 
+// Tail-first windowing: render only the most recent messages and load older ones
+// upward when the user scrolls near the top. Opening a long (multi-compaction)
+// conversation no longer mounts the entire history top-down and scrolls through it.
+const TAIL_WINDOW = 40;
+const LOAD_OLDER_BATCH = 40;
+const SCROLL_TOP_THRESHOLD = 300;
+
 interface ProgressiveMessageListProps {
   messages: Message[];
   chat: Pick<ChatType, 'sessionId'>;
+  // Scroll viewport owner, used to detect scroll-near-top and to anchor the
+  // viewport when older messages are prepended.
+  scrollAreaRef?: React.RefObject<ScrollAreaHandle | null>;
   toolCallNotifications?: Map<string, NotificationEvent[]>; // Make optional
   append?: (value: string) => void; // Make optional
   isUserMessage: (message: Message) => boolean;
-  batchSize?: number;
-  batchDelay?: number;
-  showLoadingThreshold?: number; // Only show loading if more than X messages
+  // True while in-page search is open; expands the window to the full history so
+  // search can reach every message.
+  searchActive?: boolean;
   // Custom render function for messages
   renderMessage?: (message: Message, index: number) => React.ReactNode | null;
   isStreamingMessage?: boolean; // Whether messages are currently being streamed
@@ -83,12 +93,11 @@ interface ProgressiveMessageListProps {
 export default function ProgressiveMessageList({
   messages,
   chat,
+  scrollAreaRef,
   toolCallNotifications = new Map(),
   append = () => {},
   isUserMessage,
-  batchSize = 20,
-  batchDelay = 20,
-  showLoadingThreshold = 50,
+  searchActive = false,
   renderMessage, // Custom render function
   isStreamingMessage = false, // Whether messages are currently being streamed
   onMessageUpdate,
@@ -96,15 +105,13 @@ export default function ProgressiveMessageList({
   submitElicitationResponse,
 }: ProgressiveMessageListProps) {
   const intl = useIntl();
-  const [renderedCount, setRenderedCount] = useState(() => {
-    // Initialize with either all messages (if small) or first batch (if large)
-    return messages.length <= showLoadingThreshold
-      ? messages.length
-      : Math.min(batchSize, messages.length);
-  });
-  const [isLoading, setIsLoading] = useState(() => messages.length > showLoadingThreshold);
-  const timeoutRef = useRef<number | null>(null);
-  const mountedRef = useRef(true);
+  // Window is [windowStart, messages.length). Anchoring on the START (not a tail
+  // COUNT) means messages appended during streaming extend the bottom and never
+  // drop the oldest rendered message — so the view never jumps when the user has
+  // scrolled up while the model is still streaming. windowStart only decreases
+  // (load older) or resets on a new session mount.
+  const [windowStart, setWindowStart] = useState(() => Math.max(0, messages.length - TAIL_WINDOW));
+  const prependAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const hasOnlyToolResponses = (message: Message) =>
     message.content.every((c) => c.type === 'toolResponse');
 
@@ -154,92 +161,60 @@ export default function ProgressiveMessageList({
     }
   };
 
-  // Simple progressive loading - start immediately when component mounts if needed
+  // Tail-first: the bottom of the conversation is already rendered on mount, so
+  // signal completion once to let BaseChat anchor the viewport at the bottom.
   useEffect(() => {
-    if (messages.length <= showLoadingThreshold) {
-      setRenderedCount(messages.length);
-      setIsLoading(false);
-      // For small lists, call completion callback immediately
-      if (onRenderingComplete) {
-        setTimeout(() => onRenderingComplete(), 50);
-      }
-      return;
-    }
-
-    // Large list - start progressive loading
-    const loadNextBatch = () => {
-      setRenderedCount((current) => {
-        const nextCount = Math.min(current + batchSize, messages.length);
-
-        if (nextCount >= messages.length) {
-          setIsLoading(false);
-          // Call the completion callback after a brief delay to ensure DOM is updated
-          if (onRenderingComplete) {
-            setTimeout(() => onRenderingComplete(), 50);
-          }
-        } else {
-          // Schedule next batch
-          timeoutRef.current = window.setTimeout(loadNextBatch, batchDelay);
-        }
-
-        return nextCount;
-      });
-    };
-
-    // Start loading after a short delay
-    timeoutRef.current = window.setTimeout(loadNextBatch, batchDelay);
-
-    return () => {
-      if (timeoutRef.current) {
-        window.clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
-    };
-  }, [
-    messages.length,
-    batchSize,
-    batchDelay,
-    showLoadingThreshold,
-    renderedCount,
-    onRenderingComplete,
-  ]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      if (timeoutRef.current) {
-        window.clearTimeout(timeoutRef.current);
-      }
-    };
+    if (!onRenderingComplete) return;
+    const t = setTimeout(() => onRenderingComplete(), 50);
+    return () => clearTimeout(t);
+    // Fire once on mount; messages are present when BaseChat mounts this list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Force complete rendering when search is active
+  // Keep windowStart in range when the messages array shrinks (compaction /
+  // HistoryReplaced). Without this the load-older / scroll effects would key off
+  // a stale start past the new end. renderMessages also clamps defensively.
   useEffect(() => {
-    // Only add listener if we're actually loading
-    if (!isLoading) {
-      return;
-    }
+    const maxStart = Math.max(0, messages.length - TAIL_WINDOW);
+    setWindowStart((current) => (current > maxStart ? maxStart : current));
+  }, [messages.length]);
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const isMac = window.electron.platform === 'darwin';
-      const isSearchShortcut = (isMac ? e.metaKey : e.ctrlKey) && e.key === 'f';
+  // While in-page search is open, render the whole history so search can reach
+  // any message. Driven by SearchView's open state (not a raw Cmd+F keydown) so
+  // the window is fully expanded BEFORE the user types and the highlighter runs;
+  // SearchHighlighter's MutationObserver then re-highlights as older messages
+  // mount. This closes the first-search race where windowed-out matches were
+  // missed.
+  useEffect(() => {
+    if (searchActive) setWindowStart(0);
+  }, [searchActive]);
 
-      if (isSearchShortcut) {
-        // Immediately render all messages when search is triggered
-        setRenderedCount(messages.length);
-        setIsLoading(false);
-        if (timeoutRef.current) {
-          window.clearTimeout(timeoutRef.current);
-          timeoutRef.current = null;
-        }
+  // Grow the window upward when the user scrolls near the top (load older).
+  useEffect(() => {
+    const viewport = scrollAreaRef?.current?.viewportRef.current;
+    if (!viewport || windowStart <= 0) return;
+    const onScroll = () => {
+      if (viewport.scrollTop < SCROLL_TOP_THRESHOLD && !prependAnchorRef.current) {
+        prependAnchorRef.current = {
+          scrollHeight: viewport.scrollHeight,
+          scrollTop: viewport.scrollTop,
+        };
+        setWindowStart((current) => Math.max(0, current - LOAD_OLDER_BATCH));
       }
     };
+    viewport.addEventListener('scroll', onScroll, { passive: true });
+    return () => viewport.removeEventListener('scroll', onScroll);
+  }, [scrollAreaRef, windowStart]);
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isLoading, messages.length]);
+  // After older messages prepend, restore scroll position so the view doesn't jump.
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    const viewport = scrollAreaRef?.current?.viewportRef.current;
+    if (anchor && viewport) {
+      viewport.scrollTop = anchor.scrollTop + (viewport.scrollHeight - anchor.scrollHeight);
+      prependAnchorRef.current = null;
+    }
+  });
 
   // Detect tool call chains
   const toolCallChains = useMemo(() => identifyConsecutiveToolCalls(messages), [messages]);
@@ -271,11 +246,20 @@ export default function ProgressiveMessageList({
     };
   }, [messages]);
 
-  // Render messages up to the current rendered count
+  // Render the tail window; `index` is the absolute index in the full
+  // conversation (the slice no longer starts at 0).
   const renderMessages = useCallback(() => {
-    const messagesToRender = messages.slice(0, renderedCount);
+    // Clamp the window start to the current length every render. A compaction /
+    // HistoryReplaced can swap in a SHORTER messages array; without this clamp a
+    // stale windowStart past the new end yields an empty slice and a blank
+    // conversation. Math.max(0, length - TAIL_WINDOW) keeps at least the tail
+    // visible and never exceeds windowStart, so the view never grows past what
+    // the user already loaded.
+    const start = Math.min(windowStart, Math.max(0, messages.length - TAIL_WINDOW));
+    const messagesToRender = messages.slice(start);
     return messagesToRender
-      .map((message, index) => {
+      .map((message, sliceIndex) => {
+        const index = start + sliceIndex;
         if (!message.metadata.userVisible) {
           return null;
         }
@@ -339,7 +323,7 @@ export default function ProgressiveMessageList({
                   isStreaming={
                     isStreamingMessage &&
                     !isUser &&
-                    index === messagesToRender.length - 1 &&
+                    sliceIndex === messagesToRender.length - 1 &&
                     message.role === 'assistant'
                   }
                   hideTimestamp={shouldHideTimestamp(index, toolCallChains)}
@@ -357,7 +341,7 @@ export default function ProgressiveMessageList({
       .filter(Boolean);
   }, [
     messages,
-    renderedCount,
+    windowStart,
     renderMessage,
     isUserMessage,
     chat,
@@ -373,24 +357,5 @@ export default function ProgressiveMessageList({
     renderModelChangeDisclosure,
   ]);
 
-  return (
-    <>
-      {renderMessages()}
-
-      {/* Loading indicator when progressively rendering */}
-      {isLoading && (
-        <div className="flex flex-col items-center justify-center py-8">
-          <LoadingGoose
-            message={intl.formatMessage(i18n.loadingMessages, {
-              renderedCount,
-              totalCount: messages.length,
-            })}
-          />
-          <div className="text-xs text-text-secondary mt-2">
-            {intl.formatMessage(i18n.searchHint)}
-          </div>
-        </div>
-      )}
-    </>
-  );
+  return <>{renderMessages()}</>;
 }
