@@ -192,36 +192,51 @@ function isValidLanguageSetting(value: unknown): value is Settings['language'] {
   return typeof value === 'string' && validLanguageSettings.has(value as Settings['language']);
 }
 
-function getSettings(): Settings {
+// Parsed settings are cached in-process: getSettings() is called from many IPC
+// handlers and, critically, from onHeadersReceived on every HTTP response, so an
+// uncached readFileSync+JSON.parse blocked the main thread once per streamed SSE
+// event. updateSettings() is the sole writer and refreshes the cache after
+// persisting. External on-disk edits to settings.json are not picked up until the
+// app restarts.
+let cachedSettings: Settings | null = null;
+
+function readSettingsFromDisk(): Settings {
   if (fsSync.existsSync(SETTINGS_FILE)) {
-    let stored: Partial<Settings>;
     try {
-      const data = fsSync.readFileSync(SETTINGS_FILE, 'utf8');
-      stored = JSON.parse(data) as Partial<Settings>;
+      const stored = JSON.parse(fsSync.readFileSync(SETTINGS_FILE, 'utf8')) as Partial<Settings>;
+      return {
+        ...defaultSettings,
+        ...stored,
+        externalGoosed: {
+          ...defaultSettings.externalGoosed,
+          ...(stored.externalGoosed ?? {}),
+        },
+        keyboardShortcuts: {
+          ...defaultSettings.keyboardShortcuts,
+          ...(stored.keyboardShortcuts ?? {}),
+        },
+      };
     } catch (err) {
       console.error('Failed to read settings.json, using defaults:', err);
-      return defaultSettings;
     }
-    return {
-      ...defaultSettings,
-      ...stored,
-      externalGoosed: {
-        ...defaultSettings.externalGoosed,
-        ...(stored.externalGoosed ?? {}),
-      },
-      keyboardShortcuts: {
-        ...defaultSettings.keyboardShortcuts,
-        ...(stored.keyboardShortcuts ?? {}),
-      },
-    };
   }
-  return defaultSettings;
+  return { ...defaultSettings };
+}
+
+// Returns the live cached object — do not mutate it directly; persist changes
+// through updateSettings() so the cache and settings.json stay in sync.
+function getSettings(): Settings {
+  if (!cachedSettings) {
+    cachedSettings = readSettingsFromDisk();
+  }
+  return cachedSettings;
 }
 
 function updateSettings(modifier: (settings: Settings) => void): void {
   const settings = getSettings();
   modifier(settings);
   fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  cachedSettings = settings;
 }
 
 function getConfiguredGooseLocale(): string | undefined {
@@ -1737,10 +1752,10 @@ ipcMain.handle('set-setting', (_event, key: SettingKey, value: unknown) => {
     return;
   }
 
-  const settings = getSettings();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (settings as any)[key] = value;
-  fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  updateSettings((settings) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (settings as any)[key] = value;
+  });
 
   if (key === 'language') {
     appConfig.GOOSE_LOCALE = getConfiguredGooseLocale();
