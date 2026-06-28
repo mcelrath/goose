@@ -123,9 +123,15 @@ export function findMessageForChunk(
     return lastMergeableMessageWithRole(state, role);
   }
 
-  const existing = state.messages.find(
-    (message) => message.id === messageId && message.role === role
-  );
+  // The streaming message is almost always the last one; check it before the
+  // O(N) scan so per-delta lookup is O(1) amortized instead of O(messages).
+  // This relies on message ids being unique per role; if the last message is
+  // not the match it correctly falls back to the full scan below.
+  const lastMessage = state.messages[state.messages.length - 1];
+  const existing =
+    lastMessage?.id === messageId && lastMessage.role === role
+      ? lastMessage
+      : state.messages.find((message) => message.id === messageId && message.role === role);
   if (existing) {
     return existing;
   }

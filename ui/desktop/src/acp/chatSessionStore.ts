@@ -168,12 +168,78 @@ function createAcpChatSessionStoreInternal(): AcpChatSessionStoreInternal {
     return entry;
   };
 
+  // Streaming deltas arrive far faster than the screen refreshes; fanning a
+  // React re-render out per delta is what makes long responses crawl. Coalesce
+  // the listener fan-out for the high-frequency delta path to one flush per
+  // animation frame. Every action still computes and returns its snapshot
+  // synchronously (so callers and tests are unaffected); only the React
+  // notification is batched. Non-delta transitions notify synchronously and
+  // drain any queued deltas first, so ordering and the final frame are exact.
+  const pendingFlush = new Set<string>();
+  let rafHandle: number | null = null;
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+  const cancelScheduledFlush = (): void => {
+    if (rafHandle !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(rafHandle);
+    }
+    rafHandle = null;
+    if (timeoutHandle !== null) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+  };
+
+  const fanOut = (sessionId: string): void => {
+    const entry = sessionsById.get(sessionId);
+    if (!entry) {
+      return;
+    }
+    const listeners = listenersBySessionId.get(sessionId);
+    if (!listeners) {
+      return;
+    }
+    const snapshot = snapshotFromEntry(entry);
+    for (const listener of listeners) {
+      listener(snapshot);
+    }
+  };
+
+  const flushPending = (): void => {
+    cancelScheduledFlush();
+    const sessionIds = [...pendingFlush];
+    pendingFlush.clear();
+    for (const sessionId of sessionIds) {
+      fanOut(sessionId);
+    }
+  };
+
   const notify = (sessionId: string, entry: StoreEntry): AcpChatSessionSnapshot => {
     const snapshot = snapshotFromEntry(entry);
+    if (pendingFlush.size > 0) {
+      flushPending();
+    }
     const listeners = listenersBySessionId.get(sessionId);
     if (listeners) {
       for (const listener of listeners) {
         listener(snapshot);
+      }
+    }
+    return snapshot;
+  };
+
+  const notifyCoalesced = (sessionId: string, entry: StoreEntry): AcpChatSessionSnapshot => {
+    const snapshot = snapshotFromEntry(entry);
+    pendingFlush.add(sessionId);
+    if (rafHandle === null && timeoutHandle === null) {
+      if (typeof requestAnimationFrame === 'function') {
+        // rAF is throttled to ~0Hz in a backgrounded tab, so race it against a
+        // timeout: whichever fires first flushes and cancels the other, keeping
+        // a hidden tab streaming.
+        rafHandle = requestAnimationFrame(flushPending);
+        timeoutHandle = setTimeout(flushPending, 100);
+      } else {
+        flushPending();
       }
     }
     return snapshot;
@@ -417,7 +483,7 @@ function createAcpChatSessionStoreInternal(): AcpChatSessionStoreInternal {
     const entry = getOrCreateEntry(notification.sessionId);
     const changes = entry.adapter.apply(notification);
     applyChatStateChanges(entry, changes);
-    return notify(notification.sessionId, entry);
+    return notifyCoalesced(notification.sessionId, entry);
   };
 
   const applyAcpGooseSessionNotification: AcpChatSessionActions['applyAcpGooseSessionNotification'] =
@@ -425,7 +491,7 @@ function createAcpChatSessionStoreInternal(): AcpChatSessionStoreInternal {
       const entry = getOrCreateEntry(notification.sessionId);
       const changes = entry.adapter.applyGoose(notification);
       applyChatStateChanges(entry, changes);
-      return notify(notification.sessionId, entry);
+      return notifyCoalesced(notification.sessionId, entry);
     };
 
   const applyPermissionRequest: AcpChatSessionActions['applyPermissionRequest'] = (request) => {
