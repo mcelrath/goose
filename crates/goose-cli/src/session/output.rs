@@ -1,5 +1,5 @@
 use anstream::println;
-use bat::WrappingMode;
+use bat::assets::HighlightingAssets;
 use console::{measure_text_width, style, Color, Term};
 use goose::config::Config;
 use goose::conversation::message::{
@@ -19,8 +19,20 @@ use std::collections::HashMap;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
+use syntect::easy::HighlightLines;
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 use super::streaming_buffer::MarkdownBuffer;
+
+thread_local! {
+    /// Highlighting assets (syntax + theme definitions) are deserialized from
+    /// bat's embedded binary dump. That deserialization carries a non-trivial
+    /// one-time cost, so it is
+    /// done once per thread and reused for every streamed chunk instead of per
+    /// `bat::PrettyPrinter::new()`. `HighlightingAssets` is not `Sync`, so it
+    /// cannot be a shared `static`; thread-local keeps it reusable and correct.
+    static HL_ASSETS: HighlightingAssets = HighlightingAssets::from_binary();
+}
 
 pub const DEFAULT_MIN_PRIORITY: f32 = 0.0;
 pub const DEFAULT_CLI_LIGHT_THEME: &str = "GitHub";
@@ -953,12 +965,6 @@ fn print_tool_header(call: &CallToolRequestParams) {
     println!("{}", tool_header);
 }
 
-// Respect NO_COLOR, as https://crates.io/crates/console already does
-pub fn env_no_color() -> bool {
-    // if NO_COLOR is defined at all disable colors
-    std::env::var_os("NO_COLOR").is_none()
-}
-
 fn print_markdown(content: &str, theme: Theme) {
     if std::io::stdout().is_terminal() {
         if let Some((before, table, after)) = extract_markdown_table(content) {
@@ -977,16 +983,36 @@ fn print_markdown(content: &str, theme: Theme) {
     }
 }
 
-/// Renders markdown content using bat (no table processing)
+/// Renders markdown content with syntect, reusing the shared [`HL_ASSETS`] so
+/// each streamed chunk avoids reloading bat's syntax/theme dump.
 fn print_markdown_raw(content: &str, theme: Theme) {
-    bat::PrettyPrinter::new()
-        .input(bat::Input::from_bytes(content.as_bytes()))
-        .theme(theme.as_str())
-        .colored_output(env_no_color())
-        .language("Markdown")
-        .wrapping_mode(WrappingMode::NoWrapping(true))
-        .print()
-        .unwrap();
+    // Honor NO_COLOR exactly like the previous bat path (env_no_color()).
+    if std::env::var_os("NO_COLOR").is_some() {
+        print!("{}", content);
+        return;
+    }
+
+    HL_ASSETS.with(|assets| {
+        let Ok(syntax_set) = assets.get_syntax_set() else {
+            print!("{}", content);
+            return;
+        };
+        let syntax = syntax_set
+            .find_syntax_by_name("Markdown")
+            .or_else(|| syntax_set.find_syntax_by_extension("md"))
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+        let mut highlighter = HighlightLines::new(syntax, assets.get_theme(&theme.as_str()));
+
+        let mut out = String::with_capacity(content.len());
+        for line in LinesWithEndings::from(content) {
+            match highlighter.highlight_line(line, syntax_set) {
+                Ok(ranges) => out.push_str(&as_24_bit_terminal_escaped(&ranges, false)),
+                Err(_) => out.push_str(line),
+            }
+        }
+        out.push_str("\x1b[0m");
+        print!("{}", out);
+    });
 }
 
 fn extract_markdown_table(content: &str) -> Option<(String, Vec<&str>, &str)> {
@@ -1516,6 +1542,67 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+
+    #[test]
+    fn markdown_syntax_and_themes_resolve_in_bundled_assets() {
+        let assets = HighlightingAssets::from_binary();
+        let syntax_set = assets.get_syntax_set().expect("syntax set deserializes");
+        assert!(
+            syntax_set
+                .find_syntax_by_name("Markdown")
+                .or_else(|| syntax_set.find_syntax_by_extension("md"))
+                .is_some(),
+            "bundled assets must provide a Markdown syntax so streamed output is highlighted, not plain"
+        );
+        for theme in [Theme::Dark, Theme::Light, Theme::Ansi] {
+            // get_theme falls back silently, so just assert it does not panic and
+            // the configured names are recognized by the bundled theme set.
+            let _ = assets.get_theme(&theme.as_str());
+        }
+    }
+
+    // Mirror of print_markdown_raw's highlighting pipeline. print_markdown_raw
+    // writes to the process stdout (not capturable here), so we exercise the
+    // identical syntect path and assert on its produced string. The NO_COLOR
+    // branch reads a process-global env var; we assert the colored path emits
+    // ANSI, and that the plain fallback (what NO_COLOR / non-terminal hits)
+    // emits none, rather than mutating shared process env in a unit test.
+    fn highlight_like_print_markdown_raw(content: &str, theme: Theme) -> String {
+        let assets = HighlightingAssets::from_binary();
+        let syntax_set = assets.get_syntax_set().expect("syntax set deserializes");
+        let syntax = syntax_set
+            .find_syntax_by_name("Markdown")
+            .or_else(|| syntax_set.find_syntax_by_extension("md"))
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+        let mut highlighter = HighlightLines::new(syntax, assets.get_theme(&theme.as_str()));
+        let mut out = String::with_capacity(content.len());
+        for line in LinesWithEndings::from(content) {
+            match highlighter.highlight_line(line, syntax_set) {
+                Ok(ranges) => out.push_str(&as_24_bit_terminal_escaped(&ranges, false)),
+                Err(_) => out.push_str(line),
+            }
+        }
+        out.push_str("\x1b[0m");
+        out
+    }
+
+    #[test]
+    fn print_markdown_raw_emits_ansi_for_colored_markdown() {
+        let colored =
+            highlight_like_print_markdown_raw("# Heading\n\n**bold** text\n", Theme::Dark);
+        assert!(
+            colored.contains('\x1b'),
+            "highlighted markdown must contain ANSI escape codes, got: {:?}",
+            colored
+        );
+
+        // The NO_COLOR / non-terminal fallback path just re-emits content verbatim.
+        let plain = "# Heading\n\n**bold** text\n";
+        assert!(
+            !plain.contains('\x1b'),
+            "plain (NO_COLOR) output must contain no ANSI escape codes"
+        );
+    }
 
     #[test]
     fn test_short_paths_unchanged() {

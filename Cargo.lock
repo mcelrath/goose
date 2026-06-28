@@ -5059,6 +5059,7 @@ dependencies = [
  "shlex 2.0.1",
  "sigstore-verify",
  "strum 0.28.0",
+ "syntect",
  "tar",
  "tempfile",
  "test-case",
