@@ -253,6 +253,7 @@ function buildContentLines({
   spinIdx,
   selectedToolCallIdx,
   queuedMessages,
+  streaming,
 }: {
   turn: Turn | undefined;
   turnIndex: number;
@@ -262,6 +263,7 @@ function buildContentLines({
   spinIdx: number;
   selectedToolCallIdx: number | null;
   queuedMessages: string[];
+  streaming: boolean;
 }): ContentLayout {
   const lines: React.ReactElement[] = [];
   const toolCallRanges: ToolCallRange[] = [];
@@ -310,6 +312,13 @@ function buildContentLines({
 
   let tcIdx = 0;
 
+  let lastContentChunkIdx = -1;
+  for (let i = 0; i < turn.responseItems.length; i++) {
+    if (turn.responseItems[i]!.itemType === "content_chunk") {
+      lastContentChunkIdx = i;
+    }
+  }
+
   for (let i = 0; i < turn.responseItems.length; i++) {
     const item = turn.responseItems[i]!;
 
@@ -327,7 +336,14 @@ function buildContentLines({
     } else if (item.itemType === "error") {
       lines.push(...renderErrorItem(item, i, safeWidth));
     } else if (item.itemType === "content_chunk") {
-      lines.push(...renderContentItem(item, i, safeWidth));
+      lines.push(
+        ...renderContentItem(
+          item,
+          i,
+          safeWidth,
+          streaming && i === lastContentChunkIdx,
+        ),
+      );
     }
   }
 
@@ -950,6 +966,7 @@ function App({
         spinIdx,
         selectedToolCallIdx,
         queuedMessages: isLatest ? queuedMessages : [],
+        streaming: isLatest && loading,
       }),
     [
       currentTurn,

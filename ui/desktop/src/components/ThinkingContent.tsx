@@ -6,9 +6,14 @@ import Expand from './ui/Expand';
 interface ThinkingContentProps {
   content: string;
   isExpanded: boolean;
+  isStreaming?: boolean;
 }
 
-export default function ThinkingContent({ content, isExpanded }: ThinkingContentProps) {
+export default function ThinkingContent({
+  content,
+  isExpanded,
+  isStreaming = false,
+}: ThinkingContentProps) {
   const [manualToggle, setManualToggle] = useState<boolean | null>(null);
   const prevIsExpanded = useRef(isExpanded);
 
@@ -29,7 +34,11 @@ export default function ThinkingContent({ content, isExpanded }: ThinkingContent
       </CollapsibleTrigger>
       <CollapsibleContent>
         <div className="mt-1 ml-[18px] text-xs text-text-secondary italic">
-          <MarkdownContent content={content} />
+          {isStreaming ? (
+            <div className="whitespace-pre-wrap break-words">{content}</div>
+          ) : (
+            <MarkdownContent content={content} />
+          )}
         </div>
       </CollapsibleContent>
     </Collapsible>

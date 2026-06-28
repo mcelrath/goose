@@ -124,6 +124,7 @@ export default function GooseMessage({
         {thinkingContent && (
           <ThinkingContent
             content={thinkingContent}
+            isStreaming={isStreaming}
             isExpanded={
               isStreaming &&
               !displayText.trim() &&
@@ -137,7 +138,13 @@ export default function GooseMessage({
           <div className="flex flex-col group">
             {displayText.trim() && (
               <div ref={contentRef} className="w-full">
-                <MarkdownContent content={displayText} />
+                {isStreaming ? (
+                  <div className="w-full whitespace-pre-wrap break-words font-sans text-text-primary">
+                    {displayText}
+                  </div>
+                ) : (
+                  <MarkdownContent content={displayText} />
+                )}
               </div>
             )}
 

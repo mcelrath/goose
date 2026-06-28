@@ -236,6 +236,43 @@ const MarkdownContent = memo(function MarkdownContent({
     setPendingLink(null);
   }, []);
 
+  // Stable plugin/component references so react-markdown does not rebuild its
+  // unified processor (and re-create every node renderer) on each render.
+  const remarkPlugins = useMemo<React.ComponentProps<typeof ReactMarkdown>['remarkPlugins']>(
+    () => [remarkGfm, remarkBreaks, [remarkMath, { singleDollarTextMath: false }]],
+    []
+  );
+  const rehypePlugins = useMemo<React.ComponentProps<typeof ReactMarkdown>['rehypePlugins']>(
+    () => [[rehypeKatex, { throwOnError: false, errorColor: '#cc0000', strict: false }]],
+    []
+  );
+  const components = useMemo(
+    () => ({
+      a: (props: React.ComponentPropsWithoutRef<'a'>) => (
+        <a
+          {...props}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!props.href) return;
+
+            if (isProtocolSafe(props.href)) {
+              window.electron.openExternal(props.href);
+            } else {
+              const protocol = getProtocol(props.href);
+              if (!protocol) return;
+              setPendingLink({ protocol, href: props.href });
+            }
+          }}
+        />
+      ),
+      code: MarkdownCode,
+    }),
+    []
+  );
+
   return (
     <>
       <div
@@ -258,42 +295,9 @@ const MarkdownContent = memo(function MarkdownContent({
       >
         <ReactMarkdown
           urlTransform={customUrlTransform}
-          remarkPlugins={[remarkGfm, remarkBreaks, [remarkMath, { singleDollarTextMath: false }]]}
-          rehypePlugins={[
-            [
-              rehypeKatex,
-              {
-                throwOnError: false,
-                errorColor: '#cc0000',
-                strict: false,
-              },
-            ],
-          ]}
-          components={{
-            a: (props) => {
-              return (
-                <a
-                  {...props}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!props.href) return;
-
-                    if (isProtocolSafe(props.href)) {
-                      window.electron.openExternal(props.href);
-                    } else {
-                      const protocol = getProtocol(props.href);
-                      if (!protocol) return;
-                      setPendingLink({ protocol, href: props.href });
-                    }
-                  }}
-                />
-              );
-            },
-            code: MarkdownCode,
-          }}
+          remarkPlugins={remarkPlugins}
+          rehypePlugins={rehypePlugins}
+          components={components}
         >
           {processedContent}
         </ReactMarkdown>

@@ -78,17 +78,53 @@ export function renderErrorItem(
   return lines;
 }
 
+function wrapPlainText(text: string, width: number): string[] {
+  const out: string[] = [];
+  for (const rawLine of text.split("\n")) {
+    if (rawLine.length === 0) {
+      out.push("");
+      continue;
+    }
+    let line = "";
+    for (const word of rawLine.split(/(\s+)/)) {
+      if (line.length + word.length <= width) {
+        line += word;
+      } else {
+        if (line) out.push(line);
+        if (word.length > width) {
+          let rest = word;
+          while (rest.length > width) {
+            out.push(rest.slice(0, width));
+            rest = rest.slice(width);
+          }
+          line = rest;
+        } else {
+          line = word.trimStart();
+        }
+      }
+    }
+    if (line) out.push(line);
+  }
+  return out;
+}
+
 export function renderContentItem(
   item: ResponseItem & { itemType: "content_chunk" },
   index: number,
-  width: number
+  width: number,
+  streaming: boolean
 ): React.ReactElement[] {
   if (item.content.type !== "text" || !item.content.text) {
     return [];
   }
 
   const constrainedWidth = Math.max(width - 2, 10);
-  const mdLines = renderMarkdown(item.content.text, constrainedWidth);
+  // While streaming, skip the markdown parse — re-parsing the whole growing
+  // message on every delta is O(n²). Render raw word-wrapped text and format
+  // it once the turn completes.
+  const mdLines = streaming
+    ? wrapPlainText(item.content.text, constrainedWidth)
+    : renderMarkdown(item.content.text, constrainedWidth);
   const lines: React.ReactElement[] = [emptyLine(`md-gap-${index}`, width)];
   
   mdLines.forEach((mdLine, j) => {
