@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::conversation::message::{ActionRequiredData, MessageMetadata};
 use crate::conversation::message::{Message, MessageContent};
 use crate::conversation::{merge_consecutive_messages, Conversation};
@@ -5,7 +6,6 @@ use crate::prompt_template::render_template;
 use crate::providers::base::Provider;
 #[cfg(test)]
 use crate::providers::base::{stream_from_single_message, MessageStream};
-use crate::{config::Config, token_counter::create_token_counter};
 use anyhow::Result;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
@@ -51,7 +51,7 @@ struct SummarizeContext {
 /// Compact messages by summarizing them
 ///
 /// This function performs the actual compaction by summarizing messages and updating
-/// their visibility metadata. It does not check thresholds - use `check_if_compaction_needed`
+/// their visibility metadata. It does not check thresholds - use `compaction_needed`
 /// first to determine if compaction is necessary.
 ///
 /// # Arguments
@@ -184,59 +184,37 @@ pub async fn compact_messages(
     ))
 }
 
-/// Check if messages exceed the auto-compaction threshold
-pub async fn check_if_compaction_needed(
-    provider: &dyn Provider,
-    conversation: &Conversation,
-    threshold_override: Option<f64>,
-    session: &crate::session::Session,
-) -> Result<bool> {
-    if provider.manages_own_context() {
-        return Ok(false);
-    }
-
-    let messages = conversation.messages();
-    let config = Config::global();
-    let threshold = threshold_override.unwrap_or_else(|| {
-        config
+/// The auto-compaction threshold (fraction of the context window) in effect,
+/// honoring an explicit override then `GOOSE_AUTO_COMPACT_THRESHOLD`.
+pub fn resolve_compaction_threshold(threshold_override: Option<f64>) -> f64 {
+    threshold_override.unwrap_or_else(|| {
+        Config::global()
             .get_param::<f64>("GOOSE_AUTO_COMPACT_THRESHOLD")
             .unwrap_or(DEFAULT_COMPACTION_THRESHOLD)
-    });
+    })
+}
 
-    let model_config = session
-        .model_config
-        .clone()
-        .unwrap_or_else(|| ModelConfig::new("unknown"));
-    let context_limit = provider
-        .get_context_limit(&model_config)
-        .await
-        .unwrap_or_else(|_| model_config.context_limit());
-
-    let (current_tokens, _token_source) = match session.usage.total_tokens {
-        Some(tokens) => (tokens as usize, "session metadata"),
-        None => {
-            let token_counter = create_token_counter()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to create token counter: {}", e))?;
-
-            let token_counts: Vec<_> = messages
-                .iter()
-                .filter(|m| m.is_agent_visible())
-                .map(|msg| token_counter.count_chat_tokens("", std::slice::from_ref(msg), &[]))
-                .collect();
-
-            (token_counts.iter().sum(), "estimated")
-        }
-    };
-
-    let usage_ratio = current_tokens as f64 / context_limit as f64;
-
-    let needs_compaction = if threshold <= 0.0 || threshold >= 1.0 {
-        false // Auto-compact is disabled.
-    } else {
-        usage_ratio > threshold
-    };
-    Ok(needs_compaction)
+/// Whether a request occupying `used_tokens` of a `context_limit`-token window
+/// exceeds the auto-compaction threshold.
+///
+/// `used_tokens` must already account for the system prompt and tool schemas,
+/// not just conversation messages — those are a large, fixed part of every
+/// request, and omitting them lets a request overflow the model's window while
+/// the estimate still looks comfortably under the limit.
+pub fn compaction_needed(
+    provider: &dyn Provider,
+    used_tokens: usize,
+    context_limit: usize,
+    threshold_override: Option<f64>,
+) -> bool {
+    if provider.manages_own_context() {
+        return false;
+    }
+    let threshold = resolve_compaction_threshold(threshold_override);
+    if threshold <= 0.0 || threshold >= 1.0 {
+        return false;
+    }
+    used_tokens as f64 / context_limit as f64 > threshold
 }
 
 fn filter_tool_responses(messages: &[Message], remove_percent: u32) -> Vec<&Message> {

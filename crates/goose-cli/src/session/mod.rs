@@ -1336,6 +1336,7 @@ impl CliSession {
                         Some(Ok(AgentEvent::Usage(usage))) => {
                             last_usage = Some(usage);
                         }
+                        Some(Ok(AgentEvent::ModelContextUsage { .. })) => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,

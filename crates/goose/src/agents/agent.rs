@@ -30,9 +30,7 @@ use crate::agents::types::{FrontendTool, SessionConfig, SharedProvider, ToolResu
 use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
 use crate::config::{get_enabled_extensions, Config, GooseMode};
-use crate::context_mgmt::{
-    check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
-};
+use crate::context_mgmt::{compact_messages, compaction_needed, resolve_compaction_threshold};
 use crate::conversation::message::{
     ActionRequiredData, InferenceMetadata, Message, MessageContent, ProviderMetadata,
     SystemNotificationType, ToolRequest,
@@ -264,6 +262,14 @@ pub struct Agent {
 pub enum AgentEvent {
     Message(Message),
     Usage(crate::providers::base::ProviderUsage),
+    /// Live estimate, emitted before each provider request, of how much of the
+    /// model's context window the request about to be sent will occupy. Lets the
+    /// UI's context indicator track the pending request instead of only the last
+    /// completed response.
+    ModelContextUsage {
+        used: usize,
+        context_limit: usize,
+    },
     McpNotification((String, ServerNotification)),
     HistoryReplaced(Conversation),
 }
@@ -1699,86 +1705,12 @@ impl Agent {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
 
-        let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
-
-        let conversation_to_compact = conversation.clone();
-
         Ok(Box::pin(async_stream::try_stream! {
             for event in command_preamble {
                 yield event;
             }
 
-            let final_conversation = if !needs_auto_compact {
-                conversation
-            } else {
-                let config = Config::global();
-                let threshold = config
-                    .get_param::<f64>("GOOSE_AUTO_COMPACT_THRESHOLD")
-                    .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
-                let threshold_percentage = (threshold * 100.0) as u32;
-
-                let inline_msg = format!(
-                    "Exceeded auto-compact threshold of {}%. Performing auto-compaction...",
-                    threshold_percentage
-                );
-
-                yield AgentEvent::Message(
-                    Message::assistant().with_system_notification(
-                        SystemNotificationType::InlineMessage,
-                        inline_msg,
-                    )
-                );
-
-                yield AgentEvent::Message(
-                    Message::assistant().with_system_notification(
-                        SystemNotificationType::ThinkingMessage,
-                        COMPACTION_THINKING_TEXT,
-                    )
-                );
-
-                let compact_model_config = self.model_config_for_session(&session_config.id).await?;
-                match compact_messages(
-                    self.provider().await?.as_ref(),
-                    &compact_model_config,
-                    &session_config.id,
-                    &conversation_to_compact,
-                    false,
-                )
-                .await
-                {
-                    Ok((compacted_conversation, summarization_usage)) => {
-                        session_manager.replace_conversation(&session_config.id, &compacted_conversation).await?;
-                        self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &summarization_usage, true).await?;
-
-                        yield AgentEvent::HistoryReplaced(compacted_conversation.clone());
-
-                        yield AgentEvent::Message(
-                            Message::assistant().with_system_notification(
-                                SystemNotificationType::InlineMessage,
-                                "Compaction complete",
-                            )
-                        );
-
-                        compacted_conversation
-                    }
-                    Err(e) => {
-                        yield AgentEvent::Message(
-                            Message::assistant().with_text(
-                                format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
-                            )
-                        );
-                        return;
-                    }
-                }
-            };
-
-            let mut reply_stream = self.reply_internal(final_conversation, session_config, session, cancel_token).await?;
+            let mut reply_stream = self.reply_internal(conversation, session_config, session, cancel_token).await?;
             while let Some(event) = reply_stream.next().await {
                 yield event?;
             }
@@ -1857,6 +1789,17 @@ impl Agent {
             .flat_map(|m| m.content.iter())
             .filter(|c| matches!(c, MessageContent::ToolRequest(_)))
             .count();
+
+        // Count the pending request locally before each provider call so we can
+        // compact proactively and report a live context figure to the UI. The
+        // counter caches per-text, so re-counting unchanged messages is cheap.
+        let token_counter = crate::token_counter::create_token_counter()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create token counter: {e}"))?;
+        let context_limit = provider
+            .get_context_limit(&model_config)
+            .await
+            .unwrap_or_else(|_| model_config.context_limit());
 
         let working_dir = session.working_dir.clone();
         let reply_stream_span = tracing::info_span!(
@@ -1961,7 +1904,9 @@ impl Agent {
                     break;
                 }
 
-                let conversation_with_moim = super::moim::inject_moim(
+                let request_provider = self.provider().await?;
+
+                let mut conversation_with_moim = super::moim::inject_moim(
                     &session_config.id,
                     conversation.clone(),
                     &self.extension_manager,
@@ -1969,8 +1914,72 @@ impl Agent {
                     max_turns,
                 ).await;
 
+                // Re-check the budget every turn against the real request size —
+                // system prompt + tool schemas + conversation. Tool outputs added
+                // mid-turn can push a request over the limit that was comfortably
+                // under it when the turn began, so checking once up front is not
+                // enough. Compact before sending rather than relying on a provider
+                // 400 to bounce us into reactive recovery.
+                let mut used_tokens = token_counter.count_chat_tokens(
+                    &system_prompt,
+                    conversation_with_moim.messages(),
+                    &tools,
+                );
+                if compaction_needed(request_provider.as_ref(), used_tokens, context_limit, None) {
+                    let threshold_percentage =
+                        (resolve_compaction_threshold(None) * 100.0) as u32;
+                    yield AgentEvent::Message(Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        format!("Exceeded auto-compact threshold of {threshold_percentage}%. Performing auto-compaction..."),
+                    ));
+                    yield AgentEvent::Message(Message::assistant().with_system_notification(
+                        SystemNotificationType::ThinkingMessage,
+                        COMPACTION_THINKING_TEXT,
+                    ));
+                    match compact_messages(
+                        request_provider.as_ref(),
+                        &model_config,
+                        &session_config.id,
+                        &conversation,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok((compacted_conversation, summarization_usage)) => {
+                            session_manager.replace_conversation(&session_config.id, &compacted_conversation).await?;
+                            self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &summarization_usage, true).await?;
+                            conversation = compacted_conversation;
+                            yield AgentEvent::HistoryReplaced(conversation.clone());
+                            yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                SystemNotificationType::InlineMessage,
+                                "Compaction complete",
+                            ));
+                            conversation_with_moim = super::moim::inject_moim(
+                                &session_config.id,
+                                conversation.clone(),
+                                &self.extension_manager,
+                                turns_taken,
+                                max_turns,
+                            ).await;
+                            used_tokens = token_counter.count_chat_tokens(
+                                &system_prompt,
+                                conversation_with_moim.messages(),
+                                &tools,
+                            );
+                        }
+                        Err(e) => {
+                            yield AgentEvent::Message(Message::assistant().with_text(
+                                format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                yield AgentEvent::ModelContextUsage { used: used_tokens, context_limit };
+
                 let mut stream = Self::stream_response_from_provider(
-                    self.provider().await?,
+                    request_provider,
                     model_config.clone(),
                     &session_config.id,
                     &system_prompt,
@@ -3691,6 +3700,7 @@ exit 0
                 AgentEvent::Message(message) => messages.push(message),
                 AgentEvent::McpNotification(_)
                 | AgentEvent::HistoryReplaced(_)
+                | AgentEvent::ModelContextUsage { .. }
                 | AgentEvent::Usage(_) => {}
             }
         }

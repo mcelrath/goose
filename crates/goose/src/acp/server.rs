@@ -835,8 +835,12 @@ pub(super) struct UsageUpdates {
     pub(super) standard: UsageUpdate,
 }
 
-pub(super) fn build_usage_updates(session: &Session) -> Option<UsageUpdates> {
-    let used = session.usage.total_tokens.unwrap_or(0).max(0) as u64;
+pub(super) fn build_usage_updates(
+    session: &Session,
+    used_override: Option<u64>,
+) -> Option<UsageUpdates> {
+    let used =
+        used_override.unwrap_or_else(|| session.usage.total_tokens.unwrap_or(0).max(0) as u64);
     let ctx_limit = session.model_config.as_ref()?.context_limit() as u64;
     let accumulated_input_tokens =
         to_nonnegative_u64(session.accumulated_usage.input_tokens).unwrap_or(0);
@@ -2622,6 +2626,23 @@ impl GooseAcpAgent {
                         ))?;
                     }
                 }
+                Ok(crate::agents::AgentEvent::ModelContextUsage { used, .. }) => {
+                    // Push the pre-request estimate so the indicator tracks the
+                    // pending request, not just the last completed response. The
+                    // end-of-turn update below settles it to the provider count.
+                    if let Ok(session) = self.session_manager.get_session(&session_id, false).await
+                    {
+                        if let Some(updates) = build_usage_updates(&session, Some(used as u64)) {
+                            if self.supports_goose_custom_notifications() {
+                                cx.send_notification(updates.custom)?;
+                            }
+                            cx.send_notification(SessionNotification::new(
+                                args.session_id.clone(),
+                                SessionUpdate::UsageUpdate(updates.standard),
+                            ))?;
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     stream_error = Some(
@@ -2654,7 +2675,7 @@ impl GooseAcpAgent {
             .get_session(&session_id, false)
             .await
             .internal_err_ctx("Failed to load session")?;
-        if let Some(updates) = build_usage_updates(&session) {
+        if let Some(updates) = build_usage_updates(&session, None) {
             if self.supports_goose_custom_notifications() {
                 cx.send_notification(updates.custom)?;
             }
@@ -3857,7 +3878,7 @@ print(\"hello, world\")
             goose_providers::model::ModelConfig::new("test-model")
                 .with_context_limit(Some(258_000)),
         );
-        let updates = build_usage_updates(&session).expect("usage updates should be present");
+        let updates = build_usage_updates(&session, None).expect("usage updates should be present");
         assert_eq!(updates.custom.session_id, "session-1");
         let usage = match updates.custom.update {
             GooseSessionUpdate::UsageUpdate(usage) => usage,
@@ -3875,7 +3896,7 @@ print(\"hello, world\")
             TokenUsage::new(Some(80), Some(40), Some(120)),
             TokenUsage::default(),
         );
-        assert!(build_usage_updates(&session).is_none());
+        assert!(build_usage_updates(&session, None).is_none());
     }
 
     #[test]
